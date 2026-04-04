@@ -4,6 +4,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 sys.path.append(r"C:\mri_synth_2026\src")
 
@@ -19,6 +20,7 @@ from mri_missing.metrics.image_metrics import ImageMetricBundle
 from mri_missing.utils.visualization import save_history_plots
 from mri_missing.losses.image_losses import CompositeSynthesisLoss
 from mri_missing.utils.ema import EMA
+
 
 def build_optimizer(cfg, model):
     name = cfg["optim"]["name"].lower()
@@ -76,18 +78,27 @@ def validate(model, loader, scheduler, time_embed, loss_fn, metric_bundle, devic
             alpha_bar = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1)
             pred_x0 = (x_t - torch.sqrt(1 - alpha_bar) * pred_noise) / (torch.sqrt(alpha_bar) + 1e-8)
 
-            loss, _ = loss_fn(pred_noise, noise, pred_x0, target)
+            total_loss, _ = loss_fn(pred_noise, noise, pred_x0, target)
 
-        losses.append(loss.item())
+        noise_mse = F.mse_loss(pred_noise, noise)
+
+        losses.append(total_loss.item())
+        metric_accum.setdefault("val_noise_mse", []).append(noise_mse.item())
 
         if compute_heavy:
             metrics = metric_bundle(pred_x0, target)
             for k, v in metrics.items():
                 metric_accum.setdefault(k, []).append(v)
 
-    out = {"val_noise_mse": sum(losses) / max(len(losses), 1)}
+    out = {
+        "val_total_loss": sum(losses) / max(len(losses), 1),
+        "val_noise_mse": sum(metric_accum["val_noise_mse"]) / max(len(metric_accum["val_noise_mse"]), 1),
+    }
+
     if compute_heavy:
         for k, vals in metric_accum.items():
+            if k == "val_noise_mse":
+                continue
             out[k] = sum(vals) / max(len(vals), 1)
 
     if was_training:
@@ -98,7 +109,7 @@ def validate(model, loader, scheduler, time_embed, loss_fn, metric_bundle, devic
 
 
 def main():
-    cfg = load_config("configs/base.yaml")
+    cfg = load_config("configs/unet_4-4.yaml")
 
     seed_everything(cfg["seed"]["value"], cfg["seed"]["deterministic"])
 
@@ -237,7 +248,7 @@ def main():
                 t_emb = time_embed(t.float())
                 x = torch.cat([cond, x_t], dim=1)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda"):
                     pred_noise = model(x, t_emb)
