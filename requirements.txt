@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+pyyaml
+nibabel
+monai
+torch
+torchvision
+torchaudio
