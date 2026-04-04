@@ -6,29 +6,43 @@ import numpy as np
 def save_history_plots(history, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
-    steps = [h["step"] for h in history]
-    train_loss = [h.get("train_loss") for h in history]
+    # -------------------------
+    # Training loss
+    # -------------------------
+    steps = [h["step"] for h in history if "train_loss" in h]
+    train_loss = [h["train_loss"] for h in history if "train_loss" in h]
 
-    plt.figure()
-    plt.plot(steps, train_loss, label="train_loss")
-    plt.xlabel("step")
-    plt.ylabel("loss")
-    plt.title("Training Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "train_loss.png"))
-    plt.close()
+    if steps:
+        plt.figure()
+        plt.plot(steps, train_loss, label="train_loss")
+        plt.xlabel("step")
+        plt.ylabel("loss")
+        plt.title("Training Loss")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "train_loss.png"))
+        plt.close()
 
+    # -------------------------
+    # Validation metrics
+    # -------------------------
     val_steps = [h["step"] for h in history if "val_noise_mse" in h]
+    val_noise = [h["val_noise_mse"] for h in history if "val_noise_mse" in h]
+
+    heavy_steps = [h["step"] for h in history if "mae" in h]
+    mae_vals = [h["mae"] for h in history if "mae" in h]
+    psnr_vals = [h["psnr"] for h in history if "psnr" in h]
+    ssim_vals = [h["ssim"] for h in history if "ssim" in h]
+
     if val_steps:
         plt.figure()
-        plt.plot(val_steps, [h["val_noise_mse"] for h in history if "val_noise_mse" in h], label="val_noise_mse")
-        if any("mae" in h for h in history):
-            plt.plot(val_steps, [h.get("mae", None) for h in history if "val_noise_mse" in h], label="mae")
-        if any("psnr" in h for h in history):
-            plt.plot(val_steps, [h.get("psnr", None) for h in history if "val_noise_mse" in h], label="psnr")
-        if any("ssim" in h for h in history):
-            plt.plot(val_steps, [h.get("ssim", None) for h in history if "val_noise_mse" in h], label="ssim")
+        plt.plot(val_steps, val_noise, label="val_noise_mse")
+
+        if heavy_steps:
+            plt.plot(heavy_steps, mae_vals, label="mae")
+            plt.plot(heavy_steps, psnr_vals, label="psnr")
+            plt.plot(heavy_steps, ssim_vals, label="ssim")
+
         plt.xlabel("step")
         plt.title("Validation Metrics")
         plt.legend()
