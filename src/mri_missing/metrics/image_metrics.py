@@ -41,12 +41,14 @@ class ImageMetricBundle:
         out = {}
 
         if self.compute_mae:
-            out["mae"] = F.l1_loss(pred, target).item()
+            out["mae"] = F.l1_loss(pred, target, reduction="mean").item()
 
         if self.compute_psnr:
-            out["psnr"] = self.psnr(pred, target).item()
+            psnr_val = self.psnr(pred, target)
+            out["psnr"] = psnr_val.mean().item() if torch.is_tensor(psnr_val) else float(psnr_val)
 
         if self.compute_ssim:
-            out["ssim"] = self.ssim(pred, target).item()
+            ssim_val = self.ssim(pred, target)
+            out["ssim"] = ssim_val.mean().item() if torch.is_tensor(ssim_val) else float(ssim_val)
 
         return out
