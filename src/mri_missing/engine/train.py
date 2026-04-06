@@ -213,6 +213,8 @@ def main():
         start_step = ckpt.get("step", 0) + 1
         best_val = ckpt.get("best_val", float("inf"))
 
+
+    print(f"Device: {device}")
     print(f"Run: {run_name}")
     print(f"Model: {model_name}")
     print(f"Trainable params: {count_params(model):,}")
@@ -272,18 +274,25 @@ def main():
                 lr = optimizer.param_groups[0]["lr"]
                 missing_str = key[0] if isinstance(key, (list, tuple)) else key
 
-                record = {
-                    "step": step,
-                    "train_loss": float(loss.item()),
-                    "missing": str(missing_str),
-                    "lr": float(lr),
-                    "step_time_sec": float(step_time),
-                    "vram_mb": float(vram_mb),
-                    "run_time_sec": float(run_timer.elapsed()),
-                }
-                record.update(loss_parts)
+                should_log = (step % cfg["train"]["log_every"] == 0)
+                do_light_val = (step % cfg["validation"]["light_every"] == 0 and step > 0)
+                do_heavy_val = (step % cfg["validation"]["heavy_every"] == 0 and step > 0)
+                should_save = (step % cfg["train"]["save_every"] == 0 and step > 0)
 
-                if step % cfg["train"]["log_every"] == 0:
+                record = None
+                if should_log or do_light_val or do_heavy_val or should_save:
+                    record = {
+                        "step": step,
+                        "train_loss": float(loss.item()),
+                        "missing": str(missing_str),
+                        "lr": float(lr),
+                        "step_time_sec": float(step_time),
+                        "vram_mb": float(vram_mb),
+                        "run_time_sec": float(run_timer.elapsed()),
+                    }
+                    record.update(loss_parts)
+
+                if should_log:
                     print(
                         f"step={step} "
                         f"loss={loss.item():.6f} "
@@ -295,9 +304,6 @@ def main():
                         f"time={step_time:.3f}s "
                         f"vram={vram_mb:.1f}MB"
                     )
-
-                do_light_val = (step % cfg["validation"]["light_every"] == 0 and step > 0)
-                do_heavy_val = (step % cfg["validation"]["heavy_every"] == 0 and step > 0)
 
                 if do_light_val or do_heavy_val:
                     val_model = ema.shadow if (ema is not None and cfg["ema"]["validate_with_ema"]) else model
@@ -312,6 +318,18 @@ def main():
                         cfg["train"]["use_amp"],
                         compute_heavy=do_heavy_val,
                     )
+
+                    if record is None:
+                        record = {
+                            "step": step,
+                            "train_loss": float(loss.item()),
+                            "missing": str(missing_str),
+                            "lr": float(lr),
+                            "step_time_sec": float(step_time),
+                            "vram_mb": float(vram_mb),
+                            "run_time_sec": float(run_timer.elapsed()),
+                        }
+                        record.update(loss_parts)
 
                     record.update(val_stats)
 
@@ -328,11 +346,19 @@ def main():
                             step, best_val, cfg, ema=ema
                         )
 
-                history.append(record)
-                save_json(os.path.join(log_dir, "history.json"), history)
-                save_history_plots(history, os.path.join(run_dir, "plots"))
+                # Persist history only when something meaningful happened
+                if record is not None:
+                    history.append(record)
 
-                if step % cfg["train"]["save_every"] == 0 and step > 0:
+                # JSON writes now follow log cadence and important events
+                if should_log or do_light_val or do_heavy_val or should_save:
+                    save_json(os.path.join(log_dir, "history.json"), history)
+
+                # Plot updates only on validation/save cadence
+                if do_light_val or do_heavy_val or should_save:
+                    save_history_plots(history, os.path.join(run_dir, "plots"))
+
+                if should_save:
                     save_checkpoint(
                         os.path.join(ckpt_dir, "latest.pt"),
                         model, optimizer, scheduler_lr, scaler,
