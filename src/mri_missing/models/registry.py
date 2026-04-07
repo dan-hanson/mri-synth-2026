@@ -15,5 +15,9 @@ def build_model(name: str, **kwargs):
         from mri_missing.models.swin_wrapper import SwinDenoiser
         return SwinDenoiser(**kwargs)
 
+    elif name == "monai_diffusion":
+        from mri_missing.models.monai_diffusion import MonaiDiffusionWrapper
+        return MonaiDiffusionWrapper(**kwargs)
+
     else:
         raise ValueError(f"Unknown model: {name}")
