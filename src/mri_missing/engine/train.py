@@ -20,6 +20,7 @@ from mri_missing.utils.visualization import save_history_plots
 from mri_missing.losses.image_losses import CompositeSynthesisLoss
 from mri_missing.utils.ema import EMA
 
+# Enable TF32 on compatible NVIDIA GPUs for faster training (with a potential minor impact on precision)
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -58,13 +59,12 @@ def should_stop(run_dir, cfg):
     return os.path.exists(stop_path)
 
 
-@torch.no_grad()
+@torch.inference_mode()  # Faster and more memory efficient than no_grad()
 def validate(model, loader, scheduler, loss_fn, metric_bundle, device, use_amp, timesteps, compute_heavy=False):
     was_training = model.training
     model.eval()
 
-    total_losses = []
-    noise_mse_vals = []
+    loss_accum = {}
     metric_accum = {}
 
     for cond, target, _ in loader:
@@ -80,42 +80,45 @@ def validate(model, loader, scheduler, loss_fn, metric_bundle, device, use_amp, 
 
         # fragile x0 reconstruction in fp32
         alpha_bar_f32 = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
+        snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
+
         pred_x0 = (
             x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
         ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
+        
+        # Clamp to prevent math explosion just like in training
+        pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
 
-        total_loss, _ = loss_fn(
+        # Extract all loss parts properly
+        total_loss, loss_parts = loss_fn(
             pred_noise.float(),
             noise.float(),
             pred_x0,
             target.float(),
+            snr=snr,
             t=t,
             timesteps=timesteps,
         )
 
-        noise_mse = F.mse_loss(pred_noise.float(), noise.float())
+        loss_accum.setdefault("val_total_loss", []).append(total_loss.item())
+        for k, v in loss_parts.items():
+            loss_accum.setdefault(f"val_{k}", []).append(v)
 
-        total_losses.append(total_loss.item())
-        noise_mse_vals.append(noise_mse.item())
-
+        # Only run the expensive 3D sliding window SSIM metric if heavy
         if compute_heavy:
             metrics = metric_bundle(pred_x0, target.float())
             for k, v in metrics.items():
                 metric_accum.setdefault(k, []).append(v)
 
-    out = {
-        "val_total_loss": sum(total_losses) / max(len(total_losses), 1),
-        "val_noise_mse": sum(noise_mse_vals) / max(len(noise_mse_vals), 1),
-    }
+    # Average all collected metrics
+    out = {k: sum(vals) / max(len(vals), 1) for k, vals in loss_accum.items()}
 
     if compute_heavy:
         for k, vals in metric_accum.items():
-            out[k] = sum(vals) / max(len(vals), 1)
+            out[f"val_{k}"] = sum(vals) / max(len(vals), 1)
 
     if was_training:
         model.train()
-    else:
-        model.eval()
 
     return out
 
@@ -204,6 +207,15 @@ def main():
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
 
     model = build_model(model_name, **model_kwargs).to(device)
+
+    # --- OS-Safe Compiler Switch ---
+    if cfg["train"].get("use_compile", False):
+        if os.name == "nt":  # 'nt' means Windows
+            print("Warning: torch.compile is not fully supported on Windows. Skipping compilation.")
+        else:
+            print("Compiling model for Linux (this will take a few minutes)...")
+            model = torch.compile(model)
+
     ema = EMA(model, decay=cfg["ema"]["decay"]) if cfg["ema"]["enabled"] else None
 
     optimizer = build_optimizer(cfg, model)
@@ -226,7 +238,7 @@ def main():
         beta_end=cfg["diffusion"]["beta_end"],
     ).to(device)
 
-    # time_embed = SinusoidalTimeEmbedding(128).to(device)
+    # time_embed = SinusoidalTimeEmbedding(128).to(device) -> not needed for monai_diffusion
 
     metric_bundle = ImageMetricBundle(
         compute_mae=cfg["metrics"]["compute_mae"],
@@ -270,7 +282,7 @@ def main():
     # Initialize zero gradients before the loop starts
     optimizer.zero_grad(set_to_none=True)
 
-    # --- ADD THIS: Background IO pool for non-blocking saves ---
+    # --- Background IO pool for non-blocking saves ---
     io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
     try:
@@ -294,7 +306,7 @@ def main():
 
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.q_sample(target, t)
-                # t_emb = time_embed(t.float())
+                # t_emb = time_embed(t.float()) -> not needed for monai_diffusion
                 x = torch.cat([cond, x_t], dim=1)
 
                 with torch.amp.autocast("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda"):
@@ -310,7 +322,7 @@ def main():
                     x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
                 ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
-                # FIX: Prevent extreme mathematical outliers from shattering the gradients
+                # Prevent extreme mathematical outliers from shattering the gradients
                 pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
 
                 loss, loss_parts = loss_fn(
@@ -323,7 +335,7 @@ def main():
                     timesteps=cfg["diffusion"]["timesteps"],
                 )
 
-                # --- 1. SAFETY CHECKS BEFORE BACKWARD ---
+                # --- SAFETY CHECKS BEFORE BACKWARD ---
                 if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(pred_x0).all():
                     print(f"NaN detected at step={step}. Saving debug checkpoint...")
                     save_checkpoint(
@@ -333,11 +345,11 @@ def main():
                     )
                     break
 
-                # --- 2. BACKWARD PASS (Scale loss for accumulation) ---
+                # --- BACKWARD PASS (Scale loss for accumulation) ---
                 loss_scaled = loss / accum_steps
                 scaler.scale(loss_scaled).backward()
 
-                # --- 3. OPTIMIZER STEP (Only every N steps) ---
+                # --- OPTIMIZER STEP (Only every N steps) ---
                 if (step + 1) % accum_steps == 0 or (step + 1) == cfg["train"]["max_steps"]:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -417,10 +429,25 @@ def main():
 
                     record.update(val_stats)
 
-                    print(
-                        "[val] "
-                        + " ".join([f"{k}={v:.6f}" for k, v in val_stats.items()])
-                    )
+                    #--- CONSOLE UI ---
+                    print(f"\n{'='*12} [ Val {'Heavy' if do_heavy_val else 'Light'} ] {'='*12}")
+                    
+                    t_loss = val_stats.get('val_total_loss', 0)
+                    n_mse = val_stats.get('val_noise_mse', 0)
+                    m_loss = val_stats.get('val_mae_loss', 0)
+                    s_loss = val_stats.get('val_ssim_loss', 0)
+                    
+                    if do_heavy_val:
+                        col3_row1 = f" ||  Clinical PSNR: {val_stats.get('val_psnr', 0):>8.4f}"
+                        col3_row2 = f" ||  Clinical SSIM: {val_stats.get('val_ssim', 0):>8.4f}  |  MAE: {val_stats.get('val_mae', 0):.4f}"
+                    else:
+                        col3_row1 = ""
+                        col3_row2 = ""
+
+                    print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}{col3_row1}")
+                    print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}{col3_row2}")
+                    print(f"{'='*39}{'='*47 if do_heavy_val else ''}\n")
+                    # --------------------------------
 
                     if val_stats["val_noise_mse"] < best_val:
                         best_val = val_stats["val_noise_mse"]
@@ -433,10 +460,12 @@ def main():
                     # Force the model out of .eval() mode and back into training
                     model.train()
 
-                    # The VRAM Flush -> require on windows to prevent memory fragmentation from causing OOMs during validation
+                    # VRAM Flush -> require on windows to prevent memory fragmentation from causing OOMs during validation
                     # should not be needed on Linux, and may hurt performance
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    # ------------------------------#
+                    # if torch.cuda.is_available():
+                    #     torch.cuda.empty_cache()
+                    # ------------------------------#
 
                 # Persist history only when something meaningful happened
                 if record is not None:
