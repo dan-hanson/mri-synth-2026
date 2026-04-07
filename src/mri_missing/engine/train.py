@@ -1,11 +1,10 @@
 import os
-from pyexpat import model
 import sys
 import time
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+import concurrent.futures
 
 sys.path.append(r"C:\mri_synth_2026\src")
 
@@ -14,7 +13,6 @@ from mri_missing.seed import seed_everything
 from mri_missing.data.dataset import BraTSDataset
 from mri_missing.models.registry import build_model
 from mri_missing.diffusion.scheduler import DiffusionScheduler
-from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 from mri_missing.utils.io import save_checkpoint, load_checkpoint, save_json
 from mri_missing.utils.stats import StepTimer, RunTimer, get_vram_mb, reset_vram_stats, count_params
 from mri_missing.metrics.image_metrics import ImageMetricBundle
@@ -61,11 +59,12 @@ def should_stop(run_dir, cfg):
 
 
 @torch.no_grad()
-def validate(model, loader, scheduler, time_embed, loss_fn, metric_bundle, device, use_amp, compute_heavy=False):
+def validate(model, loader, scheduler, loss_fn, metric_bundle, device, use_amp, timesteps, compute_heavy=False):
     was_training = model.training
     model.eval()
 
-    losses = []
+    total_losses = []
+    noise_mse_vals = []
     metric_accum = {}
 
     for cond, target, _ in loader:
@@ -74,42 +73,50 @@ def validate(model, loader, scheduler, time_embed, loss_fn, metric_bundle, devic
 
         t = scheduler.sample_timesteps(cond.shape[0], device)
         x_t, noise = scheduler.q_sample(target, t)
-        t_emb = time_embed(t.float())
         x = torch.cat([cond, x_t], dim=1)
 
         with torch.amp.autocast("cuda", enabled=use_amp and device == "cuda"):
-            pred_noise = model(x, t_emb)
+            pred_noise = model(x, t)
 
-            alpha_bar = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1)
-            pred_x0 = (x_t - torch.sqrt(1 - alpha_bar) * pred_noise) / (torch.sqrt(alpha_bar) + 1e-8)
+        # fragile x0 reconstruction in fp32
+        alpha_bar_f32 = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
+        pred_x0 = (
+            x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
+        ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
-            total_loss, _ = loss_fn(pred_noise, noise, pred_x0, target)
+        total_loss, _ = loss_fn(
+            pred_noise.float(),
+            noise.float(),
+            pred_x0,
+            target.float(),
+            t=t,
+            timesteps=timesteps,
+        )
 
-        noise_mse = F.mse_loss(pred_noise, noise)
+        noise_mse = F.mse_loss(pred_noise.float(), noise.float())
 
-        losses.append(total_loss.item())
-        metric_accum.setdefault("val_noise_mse", []).append(noise_mse.item())
+        total_losses.append(total_loss.item())
+        noise_mse_vals.append(noise_mse.item())
 
         if compute_heavy:
-            metrics = metric_bundle(pred_x0, target)
+            metrics = metric_bundle(pred_x0, target.float())
             for k, v in metrics.items():
                 metric_accum.setdefault(k, []).append(v)
 
     out = {
-        "val_total_loss": sum(losses) / max(len(losses), 1),
-        "val_noise_mse": sum(metric_accum["val_noise_mse"]) / max(len(metric_accum["val_noise_mse"]), 1),
+        "val_total_loss": sum(total_losses) / max(len(total_losses), 1),
+        "val_noise_mse": sum(noise_mse_vals) / max(len(noise_mse_vals), 1),
     }
 
     if compute_heavy:
         for k, vals in metric_accum.items():
-            if k == "val_noise_mse":
-                continue
             out[k] = sum(vals) / max(len(vals), 1)
 
     if was_training:
         model.train()
     else:
         model.eval()
+
     return out
 
 
@@ -133,16 +140,26 @@ def main():
     save_config_copy(cfg, os.path.join(run_dir, "config.yaml"))
 
     train_ds = BraTSDataset(
-        cfg["data"]["train_root"],
+        cfg["data"]["train_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["train_root"],
         patch_size=tuple(cfg["patch"]["size"]),
         fill_value=cfg["missing_policy"]["fill_value"],
         use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
+        sampling_probs=cfg["missing_policy"].get("sampling_probs", None),
+        backend=cfg["data"]["backend"],
+        augmentation=cfg.get("augmentation", {}),
     )
+
+    val_aug_cfg = dict(cfg.get("augmentation", {}))
+    val_aug_cfg["enabled"] = False
+
     val_ds = BraTSDataset(
-        cfg["data"]["val_root"],
+        cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
         patch_size=tuple(cfg["patch"]["size"]),
         fill_value=cfg["missing_policy"]["fill_value"],
         use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
+        sampling_probs=cfg["missing_policy"].get("sampling_probs", None),
+        backend=cfg["data"]["backend"],
+        augmentation=val_aug_cfg,
     )
 
     train_loader = DataLoader(
@@ -151,6 +168,7 @@ def main():
         shuffle=cfg["loader"]["shuffle"],
         num_workers=cfg["loader"]["num_workers"],
         pin_memory=cfg["loader"]["pin_memory"],
+        persistent_workers=cfg["loader"].get("persistent_workers", False),
     )
 
     val_loader = DataLoader(
@@ -159,6 +177,7 @@ def main():
         shuffle=False,
         num_workers=cfg["loader"]["num_workers"],
         pin_memory=cfg["loader"]["pin_memory"],
+        persistent_workers=cfg["loader"].get("persistent_workers", False),
     )
 
     model_name = cfg["model"]["name"].lower()
@@ -169,8 +188,20 @@ def main():
 
     if model_name == "unet":
         model_kwargs["base_ch"] = cfg["model"]["base_ch"]
+
     elif model_name == "convnext3d":
         model_kwargs["base_dim"] = cfg["model"]["base_dim"]
+
+    elif model_name == "monai_diffusion":
+        model_kwargs["channels"] = tuple(cfg["model"]["channels"])
+        model_kwargs["attention_levels"] = tuple(cfg["model"]["attention_levels"])
+        model_kwargs["num_res_blocks"] = cfg["model"]["num_res_blocks"]
+        model_kwargs["num_head_channels"] = cfg["model"]["num_head_channels"]
+        model_kwargs["norm_num_groups"] = cfg["model"].get("norm_num_groups", 32)
+        model_kwargs["norm_eps"] = cfg["model"].get("norm_eps", 1e-6)
+        model_kwargs["resblock_updown"] = cfg["model"].get("resblock_updown", False)
+        model_kwargs["transformer_num_layers"] = cfg["model"].get("transformer_num_layers", 1)
+        model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
 
     model = build_model(model_name, **model_kwargs).to(device)
     ema = EMA(model, decay=cfg["ema"]["decay"]) if cfg["ema"]["enabled"] else None
@@ -184,8 +215,6 @@ def main():
         mae_weight=cfg["loss"]["mae_weight"],
         use_ssim=cfg["loss"]["use_ssim"],
         ssim_weight=cfg["loss"]["ssim_weight"],
-        aux_clamp_min=cfg["loss"]["aux_clamp_min"],
-        aux_clamp_max=cfg["loss"]["aux_clamp_max"],
     )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda")
 
@@ -197,7 +226,7 @@ def main():
         beta_end=cfg["diffusion"]["beta_end"],
     ).to(device)
 
-    time_embed = SinusoidalTimeEmbedding(128).to(device)
+    # time_embed = SinusoidalTimeEmbedding(128).to(device)
 
     metric_bundle = ImageMetricBundle(
         compute_mae=cfg["metrics"]["compute_mae"],
@@ -235,6 +264,15 @@ def main():
     model.train()
     step = start_step
 
+    # Fetch config value (default to 1 if missing)
+    accum_steps = cfg["train"].get("accumulate_grad_batches", 1)
+    
+    # Initialize zero gradients before the loop starts
+    optimizer.zero_grad(set_to_none=True)
+
+    # --- ADD THIS: Background IO pool for non-blocking saves ---
+    io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
     try:
         while step < cfg["train"]["max_steps"]:
             for cond, target, key in train_loader:
@@ -256,29 +294,64 @@ def main():
 
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.q_sample(target, t)
-                t_emb = time_embed(t.float())
+                # t_emb = time_embed(t.float())
                 x = torch.cat([cond, x_t], dim=1)
 
-                optimizer.zero_grad(set_to_none=True)
-
                 with torch.amp.autocast("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda"):
-                    pred_noise = model(x, t_emb)
+                    pred_noise = model(x, t)
 
-                    alpha_bar = diffusion.alpha_cumprod[t].view(-1, 1, 1, 1, 1)
-                    pred_x0 = (x_t - torch.sqrt(1 - alpha_bar) * pred_noise) / (torch.sqrt(alpha_bar) + 1e-8)
+                # fragile x0 reconstruction in fp32
+                alpha_bar_f32 = diffusion.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
 
-                    loss, loss_parts = loss_fn(pred_noise, noise, pred_x0, target)
+                # Calculate exact Signal-to-Noise Ratio for this step
+                snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                if ema is not None:
-                    ema.update(model)
+                pred_x0 = (
+                    x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
+                ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
-                if scheduler_lr is not None:
-                    scheduler_lr.step()
+                # FIX: Prevent extreme mathematical outliers from shattering the gradients
+                pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
+
+                loss, loss_parts = loss_fn(
+                    pred_noise.float(),
+                    noise.float(),
+                    pred_x0,
+                    target.float(),
+                    snr=snr,
+                    t=t,
+                    timesteps=cfg["diffusion"]["timesteps"],
+                )
+
+                # --- 1. SAFETY CHECKS BEFORE BACKWARD ---
+                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(pred_x0).all():
+                    print(f"NaN detected at step={step}. Saving debug checkpoint...")
+                    save_checkpoint(
+                        os.path.join(ckpt_dir, "nan_debug.pt"),
+                        model, optimizer, scheduler_lr, scaler,
+                        step, best_val, cfg, ema=ema
+                    )
+                    break
+
+                # --- 2. BACKWARD PASS (Scale loss for accumulation) ---
+                loss_scaled = loss / accum_steps
+                scaler.scale(loss_scaled).backward()
+
+                # --- 3. OPTIMIZER STEP (Only every N steps) ---
+                if (step + 1) % accum_steps == 0 or (step + 1) == cfg["train"]["max_steps"]:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    # Zero gradients AFTER stepping
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    if ema is not None:
+                        ema.update(model)
+                    
+                    if scheduler_lr is not None:
+                        scheduler_lr.step()
 
                 step_time = step_timer.toc()
                 vram_mb = get_vram_mb() if device == "cuda" else 0.0
@@ -322,11 +395,11 @@ def main():
                         val_model,
                         val_loader,
                         diffusion,
-                        time_embed,
                         loss_fn,
                         metric_bundle,
                         device,
                         cfg["train"]["use_amp"],
+                        timesteps=cfg["diffusion"]["timesteps"],
                         compute_heavy=do_heavy_val,
                     )
 
@@ -356,6 +429,14 @@ def main():
                             model, optimizer, scheduler_lr, scaler,
                             step, best_val, cfg, ema=ema
                         )
+                    
+                    # Force the model out of .eval() mode and back into training
+                    model.train()
+
+                    # The VRAM Flush -> require on windows to prevent memory fragmentation from causing OOMs during validation
+                    # should not be needed on Linux, and may hurt performance
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 # Persist history only when something meaningful happened
                 if record is not None:
@@ -363,11 +444,11 @@ def main():
 
                 # JSON writes now follow log cadence and important events
                 if should_log or do_light_val or do_heavy_val or should_save:
-                    save_json(os.path.join(log_dir, "history.json"), history)
+                    io_executor.submit(save_json, os.path.join(log_dir, "history.json"), list(history))
 
                 # Plot updates only on validation/save cadence
                 if do_light_val or do_heavy_val or should_save:
-                    save_history_plots(history, os.path.join(run_dir, "plots"))
+                    io_executor.submit(save_history_plots, list(history), os.path.join(run_dir, "plots"))
 
                 if should_save:
                     save_checkpoint(
