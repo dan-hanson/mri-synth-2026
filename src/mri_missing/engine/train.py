@@ -1,4 +1,5 @@
 import os
+from pyexpat import model
 import sys
 import time
 import torch
@@ -20,6 +21,10 @@ from mri_missing.metrics.image_metrics import ImageMetricBundle
 from mri_missing.utils.visualization import save_history_plots
 from mri_missing.losses.image_losses import CompositeSynthesisLoss
 from mri_missing.utils.ema import EMA
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def build_optimizer(cfg, model):
@@ -109,7 +114,7 @@ def validate(model, loader, scheduler, time_embed, loss_fn, metric_bundle, devic
 
 
 def main():
-    cfg = load_config("configs/unet_4-4.yaml")
+    cfg = load_config("configs/base.yaml")
 
     seed_everything(cfg["seed"]["value"], cfg["seed"]["deterministic"])
 
@@ -179,11 +184,15 @@ def main():
         mae_weight=cfg["loss"]["mae_weight"],
         use_ssim=cfg["loss"]["use_ssim"],
         ssim_weight=cfg["loss"]["ssim_weight"],
+        aux_clamp_min=cfg["loss"]["aux_clamp_min"],
+        aux_clamp_max=cfg["loss"]["aux_clamp_max"],
     )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda")
 
     diffusion = DiffusionScheduler(
         timesteps=cfg["diffusion"]["timesteps"],
+        schedule=cfg["diffusion"].get("schedule", "linear"),
+        cosine_s=cfg["diffusion"].get("cosine_s", 0.008),
         beta_start=cfg["diffusion"]["beta_start"],
         beta_end=cfg["diffusion"]["beta_end"],
     ).to(device)
@@ -261,6 +270,8 @@ def main():
                     loss, loss_parts = loss_fn(pred_noise, noise, pred_x0, target)
 
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 if ema is not None:

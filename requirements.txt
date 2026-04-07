@@ -7,3 +7,5 @@ monai
 torch
 torchvision
 torchaudio
+einops
+tqdm
