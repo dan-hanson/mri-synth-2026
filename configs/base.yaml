@@ -25,7 +25,7 @@ loader:
   persistent_workers: true
 
 patch:
-  size: [64, 64, 64]
+  size: [80, 80, 32]
 
 model:
   name: monai_diffusion
@@ -35,9 +35,9 @@ model:
   channels: [64, 128, 256, 512]
   attention_levels: [false, false, true, true]
   num_res_blocks: 2
-  num_head_channels: 16
-
-  norm_num_groups: 16
+  num_head_channels: 32
+  
+  norm_num_groups: 32
   norm_eps: 1.0e-6
   resblock_updown: false
   transformer_num_layers: 1
@@ -57,7 +57,7 @@ optim:
 
 scheduler:
   name: cosine
-  t_max: 50000
+  t_max: 20000
   eta_min: 0.000001
 
 augmentation:
@@ -69,11 +69,12 @@ augmentation:
   rotation_max_deg: 15
 
 train:
-  max_steps: 70000
+  max_steps: 20000
   accumulate_grad_batches: 4
   save_every: 250
   log_every: 100
   use_amp: true
+  use_compile: false   # Set to false on Windows, true on Linux
   resume:  # path to checkpoint or null
 
 inference:
@@ -93,13 +94,13 @@ inference:
 
   sliding_window:
     enabled: true
-    roi_size: [96, 96, 32]
+    roi_size: [80, 80, 32]
     sw_batch_size: 4
     overlap: 0.50
 
 validation:
-  light_every: 100000
-  heavy_every: 69000
+  light_every: 1000
+  heavy_every: 2000
   
 runtime:
   device: cuda
