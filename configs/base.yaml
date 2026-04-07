@@ -3,79 +3,104 @@ project:
   output_root: outputs
   run_name: null   # if null, auto-generate
 
-mode: infer   # train | infer
+mode: train   # train | infer
 
 seed:
   value: 42
   deterministic: false
 
 data:
-  train_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
-  val_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  train_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
+  val_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData
+
+  backend: pt_cache   # nifti | pt_cache
+  train_cache_root: C:/mri_synth_2026/cache/train
+  val_cache_root: C:/mri_synth_2026/cache/val
 
 loader:
   batch_size: 1
-  num_workers: 0
+  num_workers: 4
   shuffle: true
   pin_memory: true
+  persistent_workers: true
 
 patch:
-  size: [96, 96, 64]
+  size: [64, 64, 64]
 
 model:
-  name: unet
+  name: monai_diffusion
   in_channels: 9
   out_channels: 1
-  base_ch: 16
-  base_dim: 32
+
+  channels: [64, 128, 256, 512]
+  attention_levels: [false, false, true, true]
+  num_res_blocks: 2
+  num_head_channels: 16
+
+  norm_num_groups: 16
+  norm_eps: 1.0e-6
+  resblock_updown: false
+  transformer_num_layers: 1
+  dropout_cattn: 0.1
 
 diffusion:
   timesteps: 1000
+  schedule: cosine
   beta_start: 0.0001
   beta_end: 0.02
+  cosine_s: 0.008
 
 optim:
   name: adamw
-  lr: 0.0001
+  lr: 0.00002
   weight_decay: 0.0001
 
 scheduler:
   name: cosine
-  t_max: 50
+  t_max: 50000
   eta_min: 0.000001
 
+augmentation:
+  enabled: true
+  flip_prob: 0.5
+  intensity_shift_prob: 0.5
+  intensity_shift_max: 0.1
+  rotation_prob: 0.5
+  rotation_max_deg: 15
+
 train:
-  max_steps: 60
-  save_every: 50
-  log_every: 10
+  max_steps: 70000
+  accumulate_grad_batches: 4
+  save_every: 250
+  log_every: 100
   use_amp: true
-  resume: null   # path to checkpoint or null
+  resume:  # path to checkpoint or null
 
 inference:
   checkpoint_path: null
-  run_dir: "outputs/20260403_204659_unet"
-  checkpoint_name: best.pt
+  run_dir: "outputs/20260407_023057_monai_diffusion"
+  checkpoint_name: latest.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
-  inference:
   case_ids: []
   random_case_count: 1
   random_case_seed: 42
   missing_keys: ["t1ce"]
   output_subdir: inference
   save_nifti: true
+  save_composite_nifti: true
   save_png: true
-  reverse_steps: 100
+  reverse_steps: 50
 
   sliding_window:
     enabled: true
-    roi_size: [96, 96, 64]
-    sw_batch_size: 1
-    overlap: 0.25
+    roi_size: [96, 96, 32]
+    sw_batch_size: 4
+    overlap: 0.50
 
 validation:
-  light_every: 20
-  heavy_every: 40
-
+  light_every: 100000
+  heavy_every: 69000
+  
 runtime:
   device: cuda
   cudnn_benchmark: true
@@ -89,14 +114,19 @@ metrics:
 missing_policy:
   fill_value: 1.0
   use_presence_mask: true
+  sampling_probs:
+    t1: 0.1
+    t1ce: 0.4
+    t2: 0.1
+    flair: 0.4
 
 loss:
   use_noise_mse: true
   noise_mse_weight: 1.0
   use_mae: true
-  mae_weight: 0.25
-  use_ssim: true
-  ssim_weight: 0.25
+  mae_weight: 1.0       # Lowered from 0.25 to prevent overpowering the noise MSE
+  use_ssim: true       # Turned off for training to massively boost iterations/second
+  ssim_weight: 1.0
 
 ema:
   enabled: true
