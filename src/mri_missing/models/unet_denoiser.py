@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 
 
 class ConvBlock(nn.Module):
@@ -19,8 +20,10 @@ class ConvBlock(nn.Module):
 
 
 class TinyUNet3D(nn.Module):
-    def __init__(self, in_channels=5, out_channels=1, base_ch=16):
+    def __init__(self, in_channels=9, out_channels=1, base_ch=16):
         super().__init__()
+        
+        self.time_embed = SinusoidalTimeEmbedding(128)
 
         self.time_mlp = nn.Sequential(
             nn.Linear(128, base_ch * 4),
@@ -44,13 +47,14 @@ class TinyUNet3D(nn.Module):
 
         self.out = nn.Conv3d(base_ch, out_channels, kernel_size=1)
 
-    def forward(self, x, t_emb):
+    def forward(self, x, t):
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
         b = self.bottleneck(self.pool2(e2))
 
-        t = self.time_mlp(t_emb).view(b.shape[0], -1, 1, 1, 1)
-        b = b + t
+        t_emb = self.time_embed(t.float()).to(x.dtype)
+        t_proj = self.time_mlp(t_emb).view(b.shape[0], -1, 1, 1, 1)
+        b = b + t_proj
 
         d2 = self.up2(b)
         d2 = torch.cat([d2, e2], dim=1)
