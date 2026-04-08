@@ -48,6 +48,13 @@ def build_scheduler(cfg, optimizer):
             T_max=cfg["scheduler"]["t_max"],
             eta_min=cfg["scheduler"]["eta_min"],
         )
+    elif name == "constant_with_warmup":
+        warmup_steps = cfg["scheduler"].get("warmup_steps", 2500)
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            return 1.0  # Stay flat after warmup
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif name == "none":
         return None
     else:
@@ -183,6 +190,26 @@ def main():
         persistent_workers=cfg["loader"].get("persistent_workers", False),
     )
 
+    print("\n" + "="*50)
+    print("Extracting Val Micro-Batch...")
+    golden_batches = []
+    golden_modalities = {"t1ce", "flair"}
+
+    # Grab exactly 8 batches (or whatever fits in a quick test) of the hard modalities
+    for cond, target, keys in val_loader:
+        missing_mod = keys[0] if isinstance(keys, (list, tuple)) else keys
+        if missing_mod in golden_modalities:
+            # .clone() ensures we don't hold the dataloader worker memory open
+            # We keep them on CPU to save VRAM until validate() needs them
+            golden_batches.append((cond.clone(), target.clone(), keys))
+            
+        if len(golden_batches) >= 8:
+            break
+
+    print(f"Locked {len(golden_batches)} fixed batches for val comparison.")
+    print(f"Targeting strictly: {golden_modalities}")
+    print("="*50 + "\n")
+
     model_name = cfg["model"]["name"].lower()
     model_kwargs = {
         "in_channels": cfg["model"]["in_channels"],
@@ -249,6 +276,7 @@ def main():
 
     start_step = 0
     best_val = float("inf")
+    best_ssim = -float("inf") # track best SSIM separately for clinical checkpoint
 
     if cfg["train"]["resume"]:
         ckpt = load_checkpoint(
@@ -262,7 +290,7 @@ def main():
         )
         start_step = ckpt.get("step", 0) + 1
         best_val = ckpt.get("best_val", float("inf"))
-
+        best_ssim = ckpt.get("best_ssim", -float("inf"))
 
     print(f"Device: {device}")
     print(f"Run: {run_name}")
@@ -403,9 +431,11 @@ def main():
 
                 if do_light_val or do_heavy_val:
                     val_model = ema.shadow if (ema is not None and cfg["ema"]["validate_with_ema"]) else model
+                    
+                    # Pass the golden_batches to BOTH light and heavy validation
                     val_stats = validate(
                         val_model,
-                        val_loader,
+                        golden_batches, 
                         diffusion,
                         loss_fn,
                         metric_bundle,
@@ -429,8 +459,9 @@ def main():
 
                     record.update(val_stats)
 
-                    #--- CONSOLE UI ---
-                    print(f"\n{'='*12} [ Val {'Heavy' if do_heavy_val else 'Light'} ] {'='*12}")
+                    # --- CONSOLE UI ---
+                    prefix = "Val Heavy" if do_heavy_val else "Val Light"
+                    print(f"\n{'='*12} [ {prefix} ] {'='*12}")
                     
                     t_loss = val_stats.get('val_total_loss', 0)
                     n_mse = val_stats.get('val_noise_mse', 0)
@@ -438,26 +469,39 @@ def main():
                     s_loss = val_stats.get('val_ssim_loss', 0)
                     
                     if do_heavy_val:
-                        col3_row1 = f" ||  Clinical PSNR: {val_stats.get('val_psnr', 0):>8.4f}"
-                        col3_row2 = f" ||  Clinical SSIM: {val_stats.get('val_ssim', 0):>8.4f}  |  MAE: {val_stats.get('val_mae', 0):.4f}"
+                        print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
+                        print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
+                        print("-" * 65)
+                        
+                        for mod in ["t1ce", "flair"]:
+                            if f"val_{mod}_ssim" in val_stats:
+                                print(f"[{mod.upper():>5}] PSNR: {val_stats[f'val_{mod}_psnr']:>7.4f}  |  SSIM: {val_stats[f'val_{mod}_ssim']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_mae']:>7.4f}")
+                        print(f"{'='*50}\n")
                     else:
-                        col3_row1 = ""
-                        col3_row2 = ""
+                        print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}")
+                        print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}")
+                        print(f"{'='*46}\n")
 
-                    print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}{col3_row1}")
-                    print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}{col3_row2}")
-                    print(f"{'='*39}{'='*47 if do_heavy_val else ''}\n")
-                    # --------------------------------
-
+                    # --- DUAL CHECKPOINTING ---
+                    # Save the Math Checkpoint (Noise) - Updates on Light AND Heavy
                     if val_stats["val_noise_mse"] < best_val:
                         best_val = val_stats["val_noise_mse"]
                         save_checkpoint(
-                            os.path.join(ckpt_dir, "best.pt"),
+                            os.path.join(ckpt_dir, "best_noise.pt"),
                             model, optimizer, scheduler_lr, scaler,
                             step, best_val, cfg, ema=ema
                         )
                     
-                    # Force the model out of .eval() mode and back into training
+                    # Save the Clinical Checkpoint (Structure) - Updates ONLY on Heavy
+                    if "val_ssim" in val_stats and val_stats["val_ssim"] > best_ssim:
+                        best_ssim = val_stats["val_ssim"]
+                        save_checkpoint(
+                            os.path.join(ckpt_dir, "best_ssim.pt"),
+                            model, optimizer, scheduler_lr, scaler,
+                            step, best_ssim, cfg, ema=ema
+                        )
+                        print(f"*** New Best Clinical SSIM: {best_ssim:.4f} saved to best_ssim.pt ***\n")
+
                     model.train()
 
                     # VRAM Flush -> require on windows to prevent memory fragmentation from causing OOMs during validation
