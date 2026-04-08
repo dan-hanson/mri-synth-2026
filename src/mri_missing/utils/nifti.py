@@ -6,7 +6,19 @@ from mri_missing.utils.cases import FILE_MAP
 
 
 def normalize_zscore(x):
-    return (x - np.mean(x)) / (np.std(x) + 1e-8)
+    # 1. Create a boolean mask of the actual brain tissue (ignoring empty air)
+    mask = x > x.min()
+    
+    # 2. Safety check: If the volume is completely empty, return it as-is
+    if not mask.any():
+        return x
+        
+    # 3. Calculate stats ONLY on the brain tissue
+    mean_val = x[mask].mean()
+    std_val = x[mask].std()
+    
+    # 4. Normalize the volume using the true tissue stats
+    return (x - mean_val) / (std_val + 1e-8)
 
 
 def normalize_per_case_01_np(x):
