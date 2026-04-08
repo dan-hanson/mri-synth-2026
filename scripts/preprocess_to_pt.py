@@ -6,6 +6,7 @@ import numpy as np
 from tqdm import tqdm
 
 sys.path.append(r"C:\mri_synth_2026\src")
+from mri_missing.utils.nifti import normalize_zscore
 
 FILE_MAP = {
     "t1": "t1n",
@@ -13,9 +14,6 @@ FILE_MAP = {
     "t2": "t2w",
     "flair": "t2f",
 }
-
-def normalize_zscore(x: np.ndarray) -> np.ndarray:
-    return ((x - np.mean(x)) / (np.std(x) + 1e-8)).astype(np.float32)
 
 def load_case(case_dir: str):
     mods = {}
