@@ -36,8 +36,8 @@ class MonaiDiffusionWrapper(nn.Module):
             upcast_attention=False,
             dropout_cattn=dropout_cattn,
             include_fc=True,
-            use_combined_linear=False,
-            use_flash_attention=False,
+            use_combined_linear=True,
+            use_flash_attention=True,
         )
 
     def forward(self, x, t):
