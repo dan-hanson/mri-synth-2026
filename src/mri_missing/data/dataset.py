@@ -3,6 +3,7 @@ import numpy as np
 import nibabel as nib
 import torch
 from torch.utils.data import Dataset
+from mri_missing.utils.nifti import normalize_zscore
 
 class BraTSDataset(Dataset):
     def __init__(self, root_dir, patch_size=(96, 96, 64), fill_value=1.0, use_presence_mask=True, sampling_probs=None, backend="nifti", augmentation=None):
@@ -32,9 +33,6 @@ class BraTSDataset(Dataset):
             ]
 
         print(f"Loaded {len(self.cases)} cases")
-
-    def normalize(self, x):
-        return (x - np.mean(x)) / (np.std(x) + 1e-8)
     
     def crop_to_nonzero(self, mods):
         # Create a boolean mask of where any modality has tissue
@@ -195,7 +193,7 @@ class BraTSDataset(Dataset):
 
         if self.backend != "pt_cache":
             for k in mods:
-                mods[k] = self.normalize(mods[k])
+                mods[k] = normalize_zscore(mods[k])
 
         cond, target, target_key = self.random_missing(mods)
         cond, target = self.random_crop(cond, target, size=self.patch_size)
