@@ -25,14 +25,14 @@ loader:
   persistent_workers: true
 
 patch:
-  size: [80, 80, 32]
+  size: [96, 96, 32]
 
 model:
   name: monai_diffusion
   in_channels: 9
   out_channels: 1
 
-  channels: [64, 128, 256, 512]
+  channels: [96, 192, 384, 512]
   attention_levels: [false, false, true, true]
   num_res_blocks: 2
   num_head_channels: 32
@@ -41,7 +41,7 @@ model:
   norm_eps: 1.0e-6
   resblock_updown: false
   transformer_num_layers: 1
-  dropout_cattn: 0.1
+  dropout_cattn: 0.0
 
 diffusion:
   timesteps: 1000
@@ -52,13 +52,14 @@ diffusion:
 
 optim:
   name: adamw
-  lr: 0.00002
+  lr: 0.0001
   weight_decay: 0.0001
 
 scheduler:
-  name: cosine
-  t_max: 20000
-  eta_min: 0.000001
+  name: "constant_with_warmup" # constant_with_warmup | cosine -> if using cosine, also set warmup_steps to 0
+  warmup_steps: 2500  # Ramp up over the first 2.5k steps, then hold the line
+  # t_max: 50000  # Only used for cosine scheduler, ignored by constant_with_warmup
+  # eta_min: 0.00001  # Only used for cosine scheduler, ignored by constant_with_warmup
 
 augmentation:
   enabled: true
@@ -69,38 +70,39 @@ augmentation:
   rotation_max_deg: 15
 
 train:
-  max_steps: 20000
+  max_steps: 100000
   accumulate_grad_batches: 4
-  save_every: 250
-  log_every: 100
+  save_every: 1000
+  log_every: 1000
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
-  resume:  # path to checkpoint or null
+  resume: # path to checkpoint or null
 
 inference:
   checkpoint_path: null
-  run_dir: "outputs/20260407_023057_monai_diffusion"
-  checkpoint_name: latest.pt
+  use_compile: false
+  run_dir: "outputs/20260408_000923_monai_diffusion"
+  checkpoint_name: best.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
   case_ids: []
   random_case_count: 1
   random_case_seed: 42
-  missing_keys: ["t1ce"]
+  missing_keys: ["t1"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
   save_nifti: true
   save_composite_nifti: true
   save_png: true
-  reverse_steps: 50
+  reverse_steps: 100
 
   sliding_window:
     enabled: true
-    roi_size: [80, 80, 32]
-    sw_batch_size: 4
+    roi_size: [96, 96, 32]
+    sw_batch_size: 2
     overlap: 0.50
 
 validation:
-  light_every: 1000
-  heavy_every: 2000
+  light_every: 100000
+  heavy_every: 3000
   
 runtime:
   device: cuda
@@ -116,10 +118,10 @@ missing_policy:
   fill_value: 1.0
   use_presence_mask: true
   sampling_probs:
-    t1: 0.1
-    t1ce: 0.4
-    t2: 0.1
-    flair: 0.4
+    t1: 0.25
+    t1ce: 0.25
+    t2: 0.25
+    flair: 0.25
 
 loss:
   use_noise_mse: true
