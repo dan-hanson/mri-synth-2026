@@ -66,63 +66,104 @@ def should_stop(run_dir, cfg):
     return os.path.exists(stop_path)
 
 
-@torch.inference_mode()  # Faster and more memory efficient than no_grad()
-def validate(model, loader, scheduler, loss_fn, metric_bundle, device, use_amp, timesteps, compute_heavy=False):
+@torch.inference_mode()
+def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, use_amp, timesteps, compute_heavy=False):
     was_training = model.training
     model.eval()
 
     loss_accum = {}
     metric_accum = {}
+    modality_metrics = {}
 
-    for cond, target, _ in loader:
+    # detemine best available precision for generation and metrics
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    # Setup a fast 20-step DDIM schedule for proxy generation
+    if compute_heavy:
+        reverse_steps = 20
+        t_schedule = torch.linspace(0, timesteps - 1, reverse_steps, dtype=torch.long).tolist()
+        t_schedule = list(reversed(t_schedule))
+
+    for cond, target, keys, case_ids in golden_batches:
         cond = cond.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
+        # -------------------------------------------------
+        # 1. LIGHT VAL: Loss tracking at random timesteps
+        # -------------------------------------------------
         t = scheduler.sample_timesteps(cond.shape[0], device)
         x_t, noise = scheduler.q_sample(target, t)
-        x = torch.cat([cond, x_t], dim=1)
+        x_in = torch.cat([cond, x_t], dim=1)
 
-        with torch.amp.autocast("cuda", enabled=use_amp and device == "cuda"):
-            pred_noise = model(x, t)
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and device == "cuda"):
+            pred_noise = model(x_in, t)
+    
+        alpha_bar = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
+        snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
 
-        # fragile x0 reconstruction in fp32
-        alpha_bar_f32 = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
-        snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
+        pred_x0_1step = (x_t - torch.sqrt(1.0 - alpha_bar) * pred_noise) / (torch.sqrt(alpha_bar) + 1e-5)
+        pred_x0_1step = torch.clamp(pred_x0_1step, min=-3.0, max=3.0)
 
-        pred_x0 = (
-            x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
-        ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
-        
-        # Clamp to prevent math explosion just like in training
-        pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
-
-        # Extract all loss parts properly
         total_loss, loss_parts = loss_fn(
-            pred_noise.float(),
-            noise.float(),
-            pred_x0,
-            target.float(),
-            snr=snr,
-            t=t,
-            timesteps=timesteps,
+            pred_noise, noise, pred_x0_1step, target, snr=snr, t=t, timesteps=timesteps
         )
 
         loss_accum.setdefault("val_total_loss", []).append(total_loss.item())
         for k, v in loss_parts.items():
             loss_accum.setdefault(f"val_{k}", []).append(v)
 
-        # Only run the expensive 3D sliding window SSIM metric if heavy
+        # -------------------------------------------------
+        # 2. HEAVY VAL: True Generation (Mini-DDIM)
+        # -------------------------------------------------
         if compute_heavy:
-            metrics = metric_bundle(pred_x0, target.float())
-            for k, v in metrics.items():
-                metric_accum.setdefault(k, []).append(v)
+            # Start from pure static noise
+            x_gen = torch.randn_like(target)
+            
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and device == "cuda"):
+                for i, t_idx in enumerate(t_schedule):
+                    t_tensor = torch.full((cond.shape[0],), t_idx, device=device, dtype=torch.long)
+                    model_in = torch.cat([cond, x_gen], dim=1)
+                    
+                    p_noise = model(model_in, t_tensor)
+                    
+                    a_bar_t = scheduler.alpha_cumprod[t_idx].view(-1, 1, 1, 1, 1)
+                    if i < len(t_schedule) - 1:
+                        t_prev = t_schedule[i+1]
+                        a_bar_prev = scheduler.alpha_cumprod[t_prev].view(-1, 1, 1, 1, 1)
+                    else:
+                        a_bar_prev = torch.ones_like(a_bar_t)
 
-    # Average all collected metrics
+                    p_x0 = (x_gen - torch.sqrt(1 - a_bar_t) * p_noise) / torch.sqrt(a_bar_t)
+                    p_x0 = torch.clamp(p_x0, min=-3.0, max=3.0)
+                    
+                    x_gen = torch.sqrt(a_bar_prev) * p_x0 + torch.sqrt(1 - a_bar_prev) * p_noise
+
+            # Calculate Clinical Metrics on the FULLY GENERATED patch
+            for b in range(target.shape[0]):
+                # Extract the exact string modality for this specific item in the batch
+                mod = keys[b] if isinstance(keys, (list, tuple)) else keys
+                
+                # Slice the batch to isolate this specific brain
+                p_b = x_gen[b:b+1]
+                t_b = target[b:b+1]
+                
+                metrics = metric_bundle(p_b, t_b)
+                
+                # Sort metrics globally and into their specific modality bucket
+                for k, v in metrics.items():
+                    metric_accum.setdefault(k, []).append(v)
+                    modality_metrics.setdefault(mod, {}).setdefault(k, []).append(v)
+
+    # --- AVERAGE OUT ALL METRICS ---
     out = {k: sum(vals) / max(len(vals), 1) for k, vals in loss_accum.items()}
 
     if compute_heavy:
         for k, vals in metric_accum.items():
             out[f"val_{k}"] = sum(vals) / max(len(vals), 1)
+        
+        for mod, m_dict in modality_metrics.items():
+            for k, vals in m_dict.items():
+                out[f"val_{mod}_{k}"] = sum(vals) / max(len(vals), 1)
 
     if was_training:
         model.train()
@@ -163,14 +204,15 @@ def main():
     val_aug_cfg["enabled"] = False
 
     val_ds = BraTSDataset(
-        cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
-        patch_size=tuple(cfg["patch"]["size"]),
-        fill_value=cfg["missing_policy"]["fill_value"],
-        use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
-        sampling_probs=cfg["missing_policy"].get("sampling_probs", None),
-        backend=cfg["data"]["backend"],
-        augmentation=val_aug_cfg,
-    )
+            cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
+            patch_size=tuple(cfg["patch"]["size"]),
+            fill_value=cfg["missing_policy"]["fill_value"],
+            use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
+            # Force Validation to ONLY test the hard modalities
+            sampling_probs={"t1": 0.0, "t1ce": 0.5, "t2": 0.0, "flair": 0.5},
+            backend=cfg["data"]["backend"],
+            augmentation=val_aug_cfg,
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -190,25 +232,28 @@ def main():
         persistent_workers=cfg["loader"].get("persistent_workers", False),
     )
 
-    print("\n" + "="*50)
-    print("Extracting Val Micro-Batch...")
+    # --- VAL MICRO-BATCH ---
+    print("\n" + "="*60)
+    print("Extracting Validation Micro-Batch...")
     golden_batches = []
-    golden_modalities = {"t1ce", "flair"}
-
-    # Grab exactly 8 batches (or whatever fits in a quick test) of the hard modalities
-    for cond, target, keys in val_loader:
-        missing_mod = keys[0] if isinstance(keys, (list, tuple)) else keys
-        if missing_mod in golden_modalities:
-            # .clone() ensures we don't hold the dataloader worker memory open
-            # We keep them on CPU to save VRAM until validate() needs them
-            golden_batches.append((cond.clone(), target.clone(), keys))
-            
-        if len(golden_batches) >= 8:
+    
+    # Notice the updated unpacking: added case_ids
+    for cond, target, keys, case_ids in val_loader:
+        golden_batches.append((cond.clone(), target.clone(), keys, case_ids))
+        if len(golden_batches) >= 4: 
             break
 
-    print(f"Locked {len(golden_batches)} fixed batches for val comparison.")
-    print(f"Targeting strictly: {golden_modalities}")
-    print("="*50 + "\n")
+    print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
+    
+    # Print the exact Case IDs and their assigned missing modality
+    for b_idx, (_, _, keys, case_ids) in enumerate(golden_batches):
+        for i in range(len(keys)):
+            mod = keys[i] if isinstance(keys, (list, tuple)) else keys
+            c_id = case_ids[i] if isinstance(case_ids, (list, tuple)) else case_ids
+            print(f"  -> {c_id} [Missing: {mod.upper()}]")
+            
+    print("="*60 + "\n")
+    # ------------------------------
 
     model_name = cfg["model"]["name"].lower()
     model_kwargs = {
@@ -315,7 +360,7 @@ def main():
 
     try:
         while step < cfg["train"]["max_steps"]:
-            for cond, target, key in train_loader:
+            for cond, target, key, current_case_id in train_loader:
                 if should_stop(run_dir, cfg):
                     print("\nStop file detected. Saving checkpoint...")
                     save_checkpoint(
