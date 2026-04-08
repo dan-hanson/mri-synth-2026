@@ -201,5 +201,6 @@ class BraTSDataset(Dataset):
 
         cond = torch.tensor(cond, dtype=torch.float32)
         target = torch.tensor(target, dtype=torch.float32).unsqueeze(0)
+        case_id = os.path.basename(case_path).replace(".pt", "")
 
-        return cond, target, target_key
+        return cond, target, target_key, case_id
