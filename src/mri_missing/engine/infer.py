@@ -95,16 +95,23 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     # 1. Preserve the absolute native scanner intensities
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
     raw_target = raw_data_dict[missing_key]
-    raw_min, raw_max = raw_target.min(), raw_target.max()
+    
+    # Extract the binary brain mask
+    brain_mask = raw_target > raw_target.min()
 
-    # 2. Apply Z-Score so the model gets the distribution it was trained on
+    # 2. Capture the exact statistics of the target BEFORE normalization
+    # save these to un-z-score the prediction later
+    target_fg = raw_target[brain_mask]
+    target_mean = target_fg.mean() if len(target_fg) > 0 else 0.0
+    target_std = target_fg.std() if len(target_fg) > 0 else 1.0
+    
+    # 3. Apply Z-Score function
     for k in data_dict:
         data_dict[k] = normalize_zscore(data_dict[k])
 
     cond_np, target_np = prepare_condition(cfg, data_dict, missing_key)
 
-    mask = target_np > target_np.min()
-    coords = np.argwhere(mask)
+    coords = np.argwhere(brain_mask)
     if len(coords) > 0:
         d0, h0, w0 = coords.min(axis=0)
         d1, h1, w1 = coords.max(axis=0) + 1
@@ -170,25 +177,20 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     elapsed = time.time() - start
 
-    # --- THE INTENSITY FIX ---
+    # --- INTENSITY FIX ---
     # 1. Grab the model's Z-scored prediction
     pred_cropped = x[0, 0].detach().cpu().numpy()
     
-    # 2. Map the Z-score exactly to a [0, 1] range safely
-    pred_cropped_01 = normalize_per_case_01_np(pred_cropped)
-    
-    # 3. Upscale the [0, 1] brain back to Native Scanner space (e.g., 0 to 2500)
-    pred_native = (pred_cropped_01 * (raw_max - raw_min)) + raw_min
+    # 2. Mathematically un-Z-score using the exact target statistics we saved
+    pred_native = (pred_cropped * target_std) + target_mean
 
-    # Create empty background using the native target shape
+    # 3. Create empty background using the native target shape
     pred_full = np.zeros_like(raw_target)
     pred_full[d0:d1, h0:h1, w0:w1] = pred_native
     
-    # 4. Mask the native background (which is purely 0.0)
-    brain_mask = raw_target > raw_target.min()
+    # 4. Enforce the binary brain mask to eliminate the red background tint
     pred_full = pred_full * brain_mask
 
-    # CRITICAL: Return `raw_target` instead of `target_np`!
     return pred_full, raw_target, cond_np, affine, header, elapsed, raw_data_dict
 
 
