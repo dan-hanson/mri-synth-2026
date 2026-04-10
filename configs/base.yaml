@@ -65,10 +65,10 @@ augmentation:
   rotation_prob: 0.5 # rotatio by 90 degree increments along z axis
 
 train:
-  max_steps: 100000
+  max_steps: 100000 # if using gradient accumulation, adjust t_max in scheduler accordingly
   accumulate_grad_batches: 2 
   save_every: 1000 
-  log_every: 100 # also controls how often to plot metrics - consider rolling average for smoother curves
+  log_every: 100 # also controls how often to plot metrics - consider implementing rolling average for smoother curves
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
   resume: # path to checkpoint or null
