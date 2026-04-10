@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 
 sys.path.append(r"C:\mri_synth_2026\src")
-from mri_missing.utils.nifti import normalize_zscore
+from mri_missing.utils.nifti import normalize_zscore, normalize_strict_bound
 
 FILE_MAP = {
     "t1": "t1n",
@@ -27,7 +27,7 @@ def load_case(case_dir: str):
         if found is None:
             raise FileNotFoundError(f"Missing {mod_key} in {case_dir}")
         arr = nib.load(found).get_fdata().astype(np.float32)
-        mods[mod_key] = normalize_zscore(arr)
+        mods[mod_key] = normalize_strict_bound(arr)
     return mods
 
 def preprocess_split(input_root: str, output_root: str):

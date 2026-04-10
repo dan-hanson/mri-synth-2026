@@ -18,30 +18,27 @@ data:
   val_cache_root: C:/mri_synth_2026/cache/val
 
 loader:
-  batch_size: 1
+  batch_size: 2
   num_workers: 4
   shuffle: true
   pin_memory: true
   persistent_workers: true
 
 patch:
-  size: [96, 96, 32]
+  size: [128, 128, 64]
 
 model:
-  name: monai_diffusion
-  in_channels: 9
-  out_channels: 1
-
-  channels: [96, 192, 384, 512]
-  attention_levels: [false, false, true, true]
-  num_res_blocks: 2
-  num_head_channels: 32
-  
-  norm_num_groups: 32
-  norm_eps: 1.0e-6
-  resblock_updown: false
-  transformer_num_layers: 1
-  dropout_cattn: 0.0
+  name: "swin_ddpm"
+  in_channels: 9          
+  out_channels: 1         
+  feature_size: 72        # If it OOMs on Step 0, drop this to 24
+  window_size: [4, 4, 4]  # The 5.3x VRAM saver
+  depths: [2, 2, 2, 2]
+  num_heads: [4, 4, 8, 16]
+  use_checkpoint: true    # Crucial for 16GB VRAM
+  spatial_dims: 3
+  drop_rate: 0.2
+  attn_drop_rate: 0.0
 
 diffusion:
   timesteps: 1000
@@ -56,10 +53,9 @@ optim:
   weight_decay: 0.0001
 
 scheduler:
-  name: "constant_with_warmup" # constant_with_warmup | cosine -> if using cosine, also set warmup_steps to 0
-  warmup_steps: 2500  # Ramp up over the first 2.5k steps, then hold the line
-  # t_max: 50000  # Only used for cosine scheduler, ignored by constant_with_warmup
-  # eta_min: 0.00001  # Only used for cosine scheduler, ignored by constant_with_warmup
+  name: "cosine"
+  t_max: 50000
+  eta_min: 1.0e-6
 
 augmentation:
   enabled: true
@@ -67,13 +63,12 @@ augmentation:
   intensity_shift_prob: 0.5
   intensity_shift_max: 0.1
   rotation_prob: 0.5
-  rotation_max_deg: 15
 
 train:
   max_steps: 100000
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 2
   save_every: 1000
-  log_every: 1000
+  log_every: 100
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
   resume: # path to checkpoint or null
@@ -81,28 +76,28 @@ train:
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260408_000923_monai_diffusion"
-  checkpoint_name: best.pt
+  run_dir: "outputs/20260410_014211_swin_ddpm"
+  checkpoint_name: top_heavy_step_0050000.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
   case_ids: []
   random_case_count: 1
   random_case_seed: 42
-  missing_keys: ["t1"] # e.g. ["t1", "t1ce", "t2", "flair"]
+  missing_keys: ["flair"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
   save_nifti: true
   save_composite_nifti: true
   save_png: true
-  reverse_steps: 100
+  reverse_steps: 50
 
   sliding_window:
-    enabled: true
-    roi_size: [96, 96, 32]
-    sw_batch_size: 2
+    enabled: false
+    roi_size: [128, 128, 64]
+    sw_batch_size: 4
     overlap: 0.50
 
 validation:
-  light_every: 100000
-  heavy_every: 3000
+  light_every: 1000
+  heavy_every: 2000
   
 runtime:
   device: cuda
@@ -113,9 +108,13 @@ metrics:
   compute_psnr: true
   compute_ssim: true
   eval_norm: per_case_minmax
+  raw_eval_norm: none   # none | per_case_minmax | global_minmax
+
+checkpoint:
+  top_k_heavy: 3
 
 missing_policy:
-  fill_value: 1.0
+  fill_value: -1.0
   use_presence_mask: true
   sampling_probs:
     t1: 0.25
@@ -127,13 +126,18 @@ loss:
   use_noise_mse: true
   noise_mse_weight: 1.0
   use_mae: true
-  mae_weight: 1.0       # Lowered from 0.25 to prevent overpowering the noise MSE
-  use_ssim: true       # Turned off for training to massively boost iterations/second
+  mae_weight: 1.0
+  use_ssim: true
   ssim_weight: 1.0
+  use_texture_loss: true
+  texture_weight_max: 0.05
+  texture_fade_start: 0.4
+  texture_fade_end: 0.6
+
 
 ema:
   enabled: true
-  decay: 0.999
+  decay: 0.9999
   validate_with_ema: true
   infer_with_ema: true
 

@@ -20,6 +20,25 @@ def normalize_zscore(x):
     # 4. Normalize the volume using the true tissue stats
     return (x - mean_val) / (std_val + 1e-8)
 
+def normalize_strict_bound(x):
+    bg_val = x.min()
+    mask = x > bg_val
+    
+    if not mask.any():
+        return x
+        
+    tissue = x[mask]
+    t_min = tissue.min()
+    t_max = tissue.max()
+    
+    # Map tissue exactly to [-1.0, 1.0]
+    x_norm = np.copy(x)
+    x_norm[mask] = 2.0 * ((tissue - t_min) / (t_max - t_min + 1e-8)) - 1.0
+    
+    # Fill the background to match the exact mathematical floor
+    x_norm[~mask] = -1.0
+    
+    return x_norm
 
 def normalize_per_case_01_np(x):
     x_min = x.min()

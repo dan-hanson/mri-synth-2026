@@ -3,7 +3,7 @@ import numpy as np
 import nibabel as nib
 import torch
 from torch.utils.data import Dataset
-from mri_missing.utils.nifti import normalize_zscore
+from mri_missing.utils.nifti import normalize_strict_bound
 
 class BraTSDataset(Dataset):
     def __init__(self, root_dir, patch_size=(96, 96, 64), fill_value=1.0, use_presence_mask=True, sampling_probs=None, backend="nifti", augmentation=None):
@@ -72,28 +72,42 @@ class BraTSDataset(Dataset):
         if not self.augmentation.get("enabled", False):
             return cond, target
 
-        # Safe flips only: sagittal / coronal style axes within patch space
         flip_prob = self.augmentation.get("flip_prob", 0.0)
+
+        # 1. Safe Left/Right Mirroring (X-axis)
+        # cond: [C, X, Y, Z] -> axis 1
+        # target: [X, Y, Z] -> axis 0
         if np.random.rand() < flip_prob:
-            # flip depth axis
             cond = np.flip(cond, axis=1).copy()
             target = np.flip(target, axis=0).copy()
 
-        if np.random.rand() < flip_prob:
-            # flip height axis
-            cond = np.flip(cond, axis=2).copy()
-            target = np.flip(target, axis=1).copy()
+        # 2. Axial Rotations around the brain stem (Z-axis)
+        # We MUST rotate in the X-Y plane so the 128x128 shape does not dimension-swap!
+        if np.random.rand() < self.augmentation.get("rotation_prob", 0.0):
+            k = np.random.randint(1, 4)
+            # cond: [C, X, Y, Z] -> rotate axes 1 and 2
+            cond = np.rot90(cond, k=k, axes=(1, 2)).copy()
+            # target: [X, Y, Z] -> rotate axes 0 and 1
+            target = np.rot90(target, k=k, axes=(0, 1)).copy()
 
-        # Mild intensity shift
+        # 3. Safe Intensity Shifting (Tissue Only)
         if np.random.rand() < self.augmentation.get("intensity_shift_prob", 0.0):
             shift = np.random.uniform(
                 -self.augmentation.get("intensity_shift_max", 0.0),
                 self.augmentation.get("intensity_shift_max", 0.0),
             )
-            # only shift the first 4 channels (modalities), not the presence mask
+
             num_image_ch = 4
-            cond[:num_image_ch] = cond[:num_image_ch] + shift
-            target = target + shift
+
+            # Mask out the background void (-1.0) so we only shift real tissue
+            tissue_mask_cond = cond[:num_image_ch] > -0.999
+            cond[:num_image_ch][tissue_mask_cond] += shift
+
+            tissue_mask_target = target > -0.999
+            target[tissue_mask_target] += shift
+
+            cond[:num_image_ch] = np.clip(cond[:num_image_ch], -1.0, 1.0)
+            target = np.clip(target, -1.0, 1.0)
 
         return cond, target
     
@@ -193,7 +207,7 @@ class BraTSDataset(Dataset):
 
         if self.backend != "pt_cache":
             for k in mods:
-                mods[k] = normalize_zscore(mods[k])
+                mods[k] = normalize_strict_bound(mods[k])
 
         cond, target, target_key = self.random_missing(mods)
         cond, target = self.random_crop(cond, target, size=self.patch_size)
