@@ -27,7 +27,8 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-def heavy_rank_key(val_stats):
+def heavy_rank_key(val_stats): # *** probably could be improved with a more complex weighted formula ***
+    '''Ranking key for heavy validation checkpoints. Prioritizes SSIM, then MAE, then noise MSE.'''
     return (
         float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", -1e9))),
         -float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 1e9))),
@@ -36,12 +37,14 @@ def heavy_rank_key(val_stats):
 
 
 def make_light_val_batch(val_loader, device=None):
+    '''Extract a single batch from the validation loader for quick, frequent validation during training.'''
     batch = next(iter(val_loader))
     cond, target, keys, case_ids = batch
     return [(cond.clone(), target.clone(), keys, case_ids)]
 
 
 def build_optimizer(cfg, model):
+    '''Build optimizer based on configuration. Supports Adam and AdamW.'''
     name = cfg["optim"]["name"].lower()
     lr = cfg["optim"]["lr"]
     wd = cfg["optim"]["weight_decay"]
@@ -55,6 +58,7 @@ def build_optimizer(cfg, model):
 
 
 def build_scheduler(cfg, optimizer):
+    '''Build learning rate scheduler based on config. Supports cosine_annealing and constant_with_warmup.'''
     name = cfg["scheduler"]["name"].lower()
 
     if name == "cosine":
@@ -76,6 +80,7 @@ def build_scheduler(cfg, optimizer):
         raise ValueError(f"Unknown scheduler: {name}")
 
 def should_stop(run_dir, cfg):
+    '''Check if a stop file exists in the run directory, indicating that training should be halted.'''
     stop_file = cfg.get("control", {}).get("stop_file", "STOP")
     stop_path = os.path.join(run_dir, stop_file)
     return os.path.exists(stop_path)

@@ -6,6 +6,9 @@ from mri_missing.utils.cases import FILE_MAP
 
 
 def normalize_zscore(x):
+    '''Normalizes the input volume using z-score normalization 
+    based on the mean and std of the non-background voxels. 
+    The background is defined as the minimum intensity value in the volume.'''
     # 1. Create a boolean mask of the actual brain tissue (ignoring empty air)
     mask = x > x.min()
     
@@ -21,6 +24,8 @@ def normalize_zscore(x):
     return (x - mean_val) / (std_val + 1e-8)
 
 def normalize_strict_bound(x):
+    '''Normalizes the input volume to the range [-1, 1] 
+    based on the min and max of the non-background voxels.'''
     bg_val = x.min()
     mask = x > bg_val
     
@@ -41,12 +46,16 @@ def normalize_strict_bound(x):
     return x_norm
 
 def normalize_per_case_01_np(x):
+    '''Normalizes the input volume to the range [0, 1] 
+    based on the min and max of the entire volume.'''
     x_min = x.min()
     x_max = x.max()
     return (x - x_min) / (x_max - x_min + 1e-8)
 
 
 def load_case(case_dir):
+    '''Loads a case from a directory containing NIfTI files for each modality. 
+    Expects specific naming conventions to identify modalities.'''
     data = {}
     affine = None
     header = None
@@ -74,6 +83,7 @@ def load_case(case_dir):
 
 
 def save_prediction_nifti(pred, affine, header, out_path):
+    '''Saves the prediction volume as a NIfTI file.'''
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     img = nib.Nifti1Image(pred.astype(np.float32), affine, header)
     nib.save(img, out_path)

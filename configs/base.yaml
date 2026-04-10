@@ -66,7 +66,7 @@ augmentation:
 
 train:
   max_steps: 100000 # if using gradient accumulation, adjust t_max in scheduler accordingly
-  accumulate_grad_batches: 2 
+  accumulate_grad_batches: 2 # effective batch size will be batch_size * accumulated_grad_batches
   save_every: 1000 
   log_every: 100 # also controls how often to plot metrics - consider implementing rolling average for smoother curves
   use_amp: true
@@ -136,7 +136,7 @@ loss:
 
 
 ema:
-  enabled: true
+  enabled: true # improves quality by updating a shadow model in kept in VRAM. Should be safe unless unless the model is massive and VRAM is extremely tight
   decay: 0.9999 # determines EMA update speed; close to 1.0 means slow updates and more stable EMA weights
   validate_with_ema: true
   infer_with_ema: true

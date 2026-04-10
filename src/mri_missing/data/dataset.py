@@ -35,6 +35,7 @@ class BraTSDataset(Dataset):
         print(f"Loaded {len(self.cases)} cases")
     
     def crop_to_nonzero(self, mods):
+        '''Crops all modalities to the tightest bounding box that contains all non-zero voxels across all modalities.'''
         # Create a boolean mask of where any modality has tissue
         mask = (mods["t1"] != 0) | (mods["t1ce"] != 0) | (mods["t2"] != 0) | (mods["flair"] != 0)
         
@@ -56,6 +57,7 @@ class BraTSDataset(Dataset):
         return mods
     
     def random_crop(self, cond, target, size=(96, 96, 64)):
+        '''Randomly crops a patch of the specified size from the condition and target volumes.'''
         _, D, H, W = cond.shape
         d, h, w = size
 
@@ -69,6 +71,7 @@ class BraTSDataset(Dataset):
         return cond, target
     
     def apply_augmentations(self, cond, target):
+        '''Applies data augmentations to the condition and target volumes based on the configuration.'''
         if not self.augmentation.get("enabled", False):
             return cond, target
 
@@ -112,6 +115,7 @@ class BraTSDataset(Dataset):
         return cond, target
     
     def load_case_pt(self, case_path):
+        ''''Loads a case from a pre-saved PyTorch tensor file. Expects the file to contain tensors for each modality.'''
         blob = torch.load(case_path, map_location="cpu")
         return {
             "t1": blob["t1"].numpy(),
@@ -121,6 +125,7 @@ class BraTSDataset(Dataset):
         }
 
     def load_case(self, case_path):
+        '''Loads a case from a directory containing NIfTI files for each modality. Expects specific naming conventions to identify modalities.'''
         modalities = {
             "t1": None,
             "t1ce": None,
@@ -156,6 +161,9 @@ class BraTSDataset(Dataset):
         return modalities
 
     def random_missing(self, mods):
+        ''''Randomly selects one modality to be the target (missing),
+          constructs the condition tensor with the remaining modalities. 
+          Optionally includes a presence mask and fills the missing modality with a specified value.'''
         keys = ["t1", "t1ce", "t2", "flair"]
 
         probs_cfg = getattr(self, "sampling_probs", None)

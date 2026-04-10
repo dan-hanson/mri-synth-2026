@@ -62,6 +62,8 @@ def unpad_3d(x, pad):
     return x
 
 def prepare_condition(cfg, data_dict, missing_key):
+    '''Prepares the conditioning tensor and target for inference. 
+    Handles modality masking and presence masks based on config.'''
     cond = []
     mask = []
     target = data_dict[missing_key].copy()
@@ -87,6 +89,7 @@ def prepare_condition(cfg, data_dict, missing_key):
 
 
 def resolve_checkpoint_path(cfg):
+    '''Determines the checkpoint path to load for inference based on config settings.'''
     ckpt_path = cfg["inference"].get("checkpoint_path")
     run_dir = cfg["inference"].get("run_dir")
     ckpt_name = cfg["inference"].get("checkpoint_name", "best.pt")
@@ -101,6 +104,7 @@ def resolve_checkpoint_path(cfg):
 
 
 def build_infer_model(cfg, device):
+    '''Builds the model for inference based on the config. Supports multiple architectures.'''
     model_name = cfg["model"]["name"].lower()
     model_kwargs = {
         "in_channels": cfg["model"]["in_channels"],
@@ -161,6 +165,7 @@ def build_available_support_mask(cond_np, missing_key):
 
 @torch.inference_mode()
 def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
+    '''Runs inference on a single case and returns the prediction, target, condition, and metadata.'''
     data_dict, affine, header = load_case(case_dir)
 
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
