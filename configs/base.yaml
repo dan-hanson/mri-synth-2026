@@ -3,11 +3,11 @@ project:
   output_root: outputs
   run_name: null   # if null, auto-generate
 
-mode: train   # train | infer
+mode: train   # train | infer | validate --> not currently in use
 
 seed:
   value: 42
-  deterministic: false
+  deterministic: false # if true, sets cudnn_deterministic to True and cudnn_benchmark to False for reproducibility
 
 data:
   train_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
@@ -19,10 +19,10 @@ data:
 
 loader:
   batch_size: 2
-  num_workers: 4
+  num_workers: 4 # can go higher on linux if needed
   shuffle: true
-  pin_memory: true
-  persistent_workers: true
+  pin_memory: true # can speed up dataloader
+  persistent_workers: true # can speed up dataloader
 
 patch:
   size: [128, 128, 64]
@@ -31,13 +31,13 @@ model:
   name: "swin_ddpm"
   in_channels: 9          
   out_channels: 1         
-  feature_size: 72        # If it OOMs on Step 0, drop this to 24
+  feature_size: 72        # with 32gb VRAM, can try increasing to 96 or 128 for better quality
   window_size: [4, 4, 4]  # The 5.3x VRAM saver
   depths: [2, 2, 2, 2]
-  num_heads: [4, 4, 8, 16]
-  use_checkpoint: true    # Crucial for 16GB VRAM
+  num_heads: [4, 4, 8, 16] # for 32gb VRAM, try [4, 8, 16, 32]
+  use_checkpoint: true    # mainly for for 16GB VRAM
   spatial_dims: 3
-  drop_rate: 0.2
+  drop_rate: 0.2 # could be tuned lower for better quality, but start with some regularization to stabilize training
   attn_drop_rate: 0.0
 
 diffusion:
@@ -54,21 +54,21 @@ optim:
 
 scheduler:
   name: "cosine"
-  t_max: 50000
+  t_max: 50000 # if using gradient accumulation, this should be max_steps // accumulate_grad_batches
   eta_min: 1.0e-6
 
 augmentation:
   enabled: true
   flip_prob: 0.5
   intensity_shift_prob: 0.5
-  intensity_shift_max: 0.1
-  rotation_prob: 0.5
+  intensity_shift_max: 0.1 # should be safe now, but still concerned about strength and exceeding valid range after shift
+  rotation_prob: 0.5 # rotatio by 90 degree increments along z axis
 
 train:
   max_steps: 100000
-  accumulate_grad_batches: 2
-  save_every: 1000
-  log_every: 100
+  accumulate_grad_batches: 2 
+  save_every: 1000 
+  log_every: 100 # also controls how often to plot metrics - consider rolling average for smoother curves
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
   resume: # path to checkpoint or null
@@ -79,25 +79,25 @@ inference:
   run_dir: "outputs/20260410_014211_swin_ddpm"
   checkpoint_name: top_heavy_step_0050000.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
-  case_ids: []
+  case_ids: [] # if empty, will run on all cases in data_root; otherwise specify list of case IDs to run
   random_case_count: 1
   random_case_seed: 42
   missing_keys: ["flair"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
-  save_nifti: true
-  save_composite_nifti: true
+  save_nifti: false
+  save_composite_nifti: false # saves a nifti with all channels (cond + pred)
   save_png: true
-  reverse_steps: 50
+  reverse_steps: 50 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
 
   sliding_window:
-    enabled: false
+    enabled: false # not 100% yet, but I think we leave this off for swin
     roi_size: [128, 128, 64]
     sw_batch_size: 4
     overlap: 0.50
 
-validation:
+validation: # determine how often we plot metrics during training
   light_every: 1000
-  heavy_every: 2000
+  heavy_every: 2000 # needed for topk checkpointing - can go higher for faster training, lower for more checkpoint oportunities
   
 runtime:
   device: cuda
@@ -129,7 +129,7 @@ loss:
   mae_weight: 1.0
   use_ssim: true
   ssim_weight: 1.0
-  use_texture_loss: true
+  use_texture_loss: true # experimental, may be noisy
   texture_weight_max: 0.05
   texture_fade_start: 0.4
   texture_fade_end: 0.6
@@ -137,7 +137,7 @@ loss:
 
 ema:
   enabled: true
-  decay: 0.9999
+  decay: 0.9999 # determines EMA update speed; close to 1.0 means slow updates and more stable EMA weights
   validate_with_ema: true
   infer_with_ema: true
 
