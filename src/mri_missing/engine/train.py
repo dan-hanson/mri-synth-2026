@@ -35,6 +35,87 @@ def heavy_rank_key(val_stats): # *** probably could be improved with a more comp
         -float(val_stats.get("val_noise_mse", 1e9)),
     )
 
+def _norm_high(x, lo, hi):
+    if hi <= lo:
+        return 0.0
+    return max(0.0, min(1.0, (float(x) - lo) / (hi - lo)))
+
+
+def _norm_low(x, good, bad):
+    if bad <= good:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - ((float(x) - good) / (bad - good))))
+
+
+def heavy_should_consider(val_stats, step, max_steps, cfg):
+    ckpt_cfg = cfg.get("checkpoint", {})
+    min_progress = float(ckpt_cfg.get("heavy_min_progress", 0.20))
+
+    if step < int(min_progress * max_steps):
+        return False
+
+    raw_ssim = float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", -1e9)))
+    raw_psnr = float(val_stats.get("val_raw_psnr", val_stats.get("val_psnr", -1e9)))
+    raw_mae = float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 1e9)))
+    noise = float(val_stats.get("val_noise_mse", 1e9))
+
+    if raw_ssim < float(ckpt_cfg.get("heavy_min_raw_ssim", 0.08)):
+        return False
+    if raw_psnr < float(ckpt_cfg.get("heavy_min_raw_psnr", 10.0)):
+        return False
+    if raw_mae > float(ckpt_cfg.get("heavy_max_raw_mae", 0.35)):
+        return False
+    if noise > float(ckpt_cfg.get("heavy_max_noise_mse", 0.35)):
+        return False
+
+    return True
+
+
+def heavy_rank_score(val_stats, cfg):
+    ckpt_cfg = cfg.get("checkpoint", {})
+
+    raw_ssim = float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", 0.0)))
+    raw_psnr = float(val_stats.get("val_raw_psnr", val_stats.get("val_psnr", 0.0)))
+    raw_mae = float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 1.0)))
+    noise = float(val_stats.get("val_noise_mse", 1.0))
+
+    # Default normalization ranges: tune later if needed
+    ssim_term = _norm_high(raw_ssim,
+                           ckpt_cfg.get("rank_ssim_lo", 0.05),
+                           ckpt_cfg.get("rank_ssim_hi", 0.50))
+
+    psnr_term = _norm_high(raw_psnr,
+                           ckpt_cfg.get("rank_psnr_lo", 10.0),
+                           ckpt_cfg.get("rank_psnr_hi", 24.0))
+
+    mae_term = _norm_low(raw_mae,
+                         ckpt_cfg.get("rank_mae_good", 0.08),
+                         ckpt_cfg.get("rank_mae_bad", 0.30))
+
+    noise_term = _norm_low(noise,
+                           ckpt_cfg.get("rank_noise_good", 0.03),
+                           ckpt_cfg.get("rank_noise_bad", 0.25))
+
+    w_ssim = float(ckpt_cfg.get("w_ssim", 0.45))
+    w_psnr = float(ckpt_cfg.get("w_psnr", 0.20))
+    w_mae = float(ckpt_cfg.get("w_mae", 0.20))
+    w_noise = float(ckpt_cfg.get("w_noise", 0.15))
+
+    score = (
+        w_ssim * ssim_term +
+        w_psnr * psnr_term +
+        w_mae * mae_term +
+        w_noise * noise_term
+    )
+
+    # Keep a tuple so ties are still resolved sensibly
+    return (
+        float(score),
+        float(raw_ssim),
+        -float(raw_mae),
+        float(raw_psnr),
+        -float(noise),
+    )
 
 def make_light_val_batch(val_loader, device=None):
     '''Extract a single batch from the validation loader for quick, frequent validation during training.'''
@@ -668,54 +749,64 @@ def main():
                         )
                     
                     if do_heavy_val:
-                        key = heavy_rank_key(val_stats)
-                        candidate_primary = key[0]
-
-                        # Keep legacy "best_ssim" scalar if you still want a headline number.
                         if "val_ssim" in val_stats and val_stats["val_ssim"] > best_ssim:
                             best_ssim = float(val_stats["val_ssim"])
 
-                        should_add = (len(top_heavy) < top_k_heavy) or (key > top_heavy[-1]["key"])
+                        if heavy_should_consider(val_stats, step, cfg["train"]["max_steps"], cfg):
+                            key = heavy_rank_score(val_stats, cfg)
+                            candidate_primary = key[0]
 
-                        if should_add:
-                            ckpt_path = os.path.join(ckpt_dir, f"top_heavy_step_{step:07d}.pt")
-                            save_checkpoint(
-                                ckpt_path,
-                                model, optimizer, scheduler_lr, scaler,
-                                step, candidate_primary, cfg, ema=ema
-                            )
+                            margin = float(cfg.get("checkpoint", {}).get("heavy_score_margin", 0.005))
+                            should_add = False
 
-                            top_heavy.append({
-                                "key": key,
-                                "step": int(step),
-                                "path": ckpt_path,
-                                "val_ssim": float(val_stats.get("val_ssim", 0.0)),
-                                "val_mae": float(val_stats.get("val_mae", 0.0)),
-                                "val_psnr": float(val_stats.get("val_psnr", 0.0)),
-                                "val_raw_ssim": float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", 0.0))),
-                                "val_raw_mae": float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 0.0))),
-                                "val_raw_psnr": float(val_stats.get("val_raw_psnr", val_stats.get("val_psnr", 0.0))),
-                                "val_noise_mse": float(val_stats.get("val_noise_mse", 0.0)),
-                            })
+                            if len(top_heavy) < top_k_heavy:
+                                should_add = True
+                            else:
+                                current_floor = float(top_heavy[-1]["key"][0])
+                                should_add = (float(key[0]) > current_floor + margin)
 
-                            top_heavy.sort(key=lambda x: x["key"], reverse=True)
-
-                            while len(top_heavy) > top_k_heavy:
-                                doomed = top_heavy.pop(-1)
-                                if os.path.exists(doomed["path"]):
-                                    os.remove(doomed["path"])
-
-                            save_json(os.path.join(ckpt_dir, "top_heavy.json"), top_heavy)
-
-                            print("*** Updated top-k heavy sentinel checkpoints ***")
-                            for rank, item in enumerate(top_heavy, start=1):
-                                print(
-                                    f"  #{rank} step={item['step']} "
-                                    f"raw_ssim={item['val_raw_ssim']:.4f} "
-                                    f"raw_mae={item['val_raw_mae']:.4f} "
-                                    f"noise={item['val_noise_mse']:.6f}"
+                            if should_add:
+                                ckpt_path = os.path.join(ckpt_dir, f"top_heavy_step_{step:07d}.pt")
+                                save_checkpoint(
+                                    ckpt_path,
+                                    model, optimizer, scheduler_lr, scaler,
+                                    step, candidate_primary, cfg, ema=ema
                                 )
-                            print()
+
+                                top_heavy.append({
+                                    "key": key,
+                                    "score": float(key[0]),
+                                    "step": int(step),
+                                    "path": ckpt_path,
+                                    "val_ssim": float(val_stats.get("val_ssim", 0.0)),
+                                    "val_mae": float(val_stats.get("val_mae", 0.0)),
+                                    "val_psnr": float(val_stats.get("val_psnr", 0.0)),
+                                    "val_raw_ssim": float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", 0.0))),
+                                    "val_raw_mae": float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 0.0))),
+                                    "val_raw_psnr": float(val_stats.get("val_raw_psnr", val_stats.get("val_psnr", 0.0))),
+                                    "val_noise_mse": float(val_stats.get("val_noise_mse", 0.0)),
+                                })
+
+                                top_heavy.sort(key=lambda x: x["key"], reverse=True)
+
+                                while len(top_heavy) > top_k_heavy:
+                                    doomed = top_heavy.pop(-1)
+                                    if os.path.exists(doomed["path"]):
+                                        os.remove(doomed["path"])
+
+                                save_json(os.path.join(ckpt_dir, "top_heavy.json"), top_heavy)
+
+                                print("*** Updated top-k heavy sentinel checkpoints ***")
+                                for rank, item in enumerate(top_heavy, start=1):
+                                    print(
+                                        f"  #{rank} step={item['step']} "
+                                        f"score={item['score']:.4f} "
+                                        f"raw_ssim={item['val_raw_ssim']:.4f} "
+                                        f"raw_psnr={item['val_raw_psnr']:.4f} "
+                                        f"raw_mae={item['val_raw_mae']:.4f} "
+                                        f"noise={item['val_noise_mse']:.6f}"
+                                    )
+                                print()
 
                     model.train()
 

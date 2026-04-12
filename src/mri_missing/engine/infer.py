@@ -226,30 +226,29 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     start = time.time()
     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-    with torch.autocast(device_type="cuda", dtype=amp_dtype):
-        for t_idx in scheduler.timesteps:
-            t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
-            t = torch.tensor([t_scalar], device=device, dtype=torch.long)
+    for t_idx in scheduler.timesteps:
+        t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
+        t = torch.tensor([t_scalar], device=device, dtype=torch.long)
 
-            model_in = torch.cat([cond, x], dim=1)
+        model_in = torch.cat([cond, x], dim=1)
 
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
             if use_sw:
                 def predictor(patch_in):
                     return model(patch_in, t)
-
                 pred_noise = sliding_window_inference(
-                    inputs=model_in,
-                    roi_size=roi_size,
+                    inputs=model_in, 
+                    roi_size=roi_size, 
                     sw_batch_size=sw_batch_size,
-                    predictor=predictor,
-                    overlap=overlap,
-                    mode="gaussian",
+                    predictor=predictor, 
+                    overlap=overlap, 
+                    mode="constant"
                 )
             else:
                 pred_noise = model(model_in, t)
 
-            # Clean, stable 1st-order step. No manual clamping needed!
-            x = scheduler.step(pred_noise, t_idx, x).prev_sample
+        # DDIM math in float32 outside autocast to preserve numerical stability in the scheduler step
+        x = scheduler.step(pred_noise.float(), t_idx, x.float()).prev_sample
 
     elapsed = time.time() - start
 
