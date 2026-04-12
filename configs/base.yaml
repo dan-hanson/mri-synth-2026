@@ -25,17 +25,17 @@ loader:
   persistent_workers: true # can speed up dataloader
 
 patch:
-  size: [128, 128, 64]
+  size: [128, 128, 64] #could increase this if you have room. I wouldn't worry about this as much for this run. 
 
 model:
   name: "swin_ddpm"
   in_channels: 9          
   out_channels: 1         
-  feature_size: 72        # with 32gb VRAM, can try increasing to 96 or 128 for better quality
+  feature_size: 96        # I ran this at 72 - not compute optimal. if you need to lower this just adjust num_heads accordingly
   window_size: [4, 4, 4]  # The 5.3x VRAM saver
-  depths: [2, 2, 2, 2]
-  num_heads: [4, 4, 8, 16] # for 32gb VRAM, try [4, 8, 16, 32]
-  use_checkpoint: true    # mainly for for 16GB VRAM
+  depths: [2, 2, 2, 2]    # i ran this with [2, 2, 2, 2], but am curious about adding more at the third layer only. e.g. [2, 2, 4, 2] or even [2, 2, 6, 2] if VRAM allows. This sometimes helps with swin, but for mri I'm seeing [2, 2, 2, 2] a lot
+  num_heads: [3, 6, 12, 24] # you want feature size / num_heads = 32 (96/3 = 32, or 64/2 = 32) for optimal performance - if you change feature size just make sure to adjust num_heads accordingly to maintain this ratio
+  use_checkpoint: false    # mainly for for 16GB VRAM
   spatial_dims: 3
   drop_rate: 0.2 # could be tuned lower for better quality, but start with some regularization to stabilize training
   attn_drop_rate: 0.0
@@ -76,13 +76,13 @@ train:
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260410_014211_swin_ddpm"
-  checkpoint_name: top_heavy_step_0050000.pt
+  run_dir: "outputs/20260410_133833_swin_ddpm"
+  checkpoint_name: latest.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
   case_ids: [] # if empty, will run on all cases in data_root; otherwise specify list of case IDs to run
   random_case_count: 1
   random_case_seed: 42
-  missing_keys: ["flair"] # e.g. ["t1", "t1ce", "t2", "flair"]
+  missing_keys: ["t2"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
   save_nifti: false
   save_composite_nifti: false # saves a nifti with all channels (cond + pred)
@@ -90,10 +90,10 @@ inference:
   reverse_steps: 50 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
 
   sliding_window:
-    enabled: false # not 100% yet, but I think we leave this off for swin
+    enabled: true # not 100% yet, but I think we leave this off for swin
     roi_size: [128, 128, 64]
-    sw_batch_size: 4
-    overlap: 0.50
+    sw_batch_size: 2
+    overlap: 0.0
 
 validation: # determine how often we plot metrics during training
   light_every: 1000
@@ -113,10 +113,35 @@ metrics:
 checkpoint:
   top_k_heavy: 3
 
+  heavy_min_progress: 0.20
+  heavy_score_margin: 0.001
+
+  heavy_min_raw_ssim: 0.08
+  heavy_min_raw_psnr: 10.0
+  heavy_max_raw_mae: 0.35
+  heavy_max_noise_mse: 0.35
+
+  w_ssim: 0.45
+  w_psnr: 0.20
+  w_mae: 0.20
+  w_noise: 0.15
+
+  rank_ssim_lo: 0.05
+  rank_ssim_hi: 0.50
+
+  rank_psnr_lo: 10.0
+  rank_psnr_hi: 24.0
+
+  rank_mae_good: 0.08
+  rank_mae_bad: 0.30
+
+  rank_noise_good: 0.03
+  rank_noise_bad: 0.25
+
 missing_policy:
   fill_value: -1.0
   use_presence_mask: true
-  sampling_probs:
+  sampling_probs: # 0.25 seems fine for now 
     t1: 0.25
     t1ce: 0.25
     t2: 0.25
@@ -130,14 +155,14 @@ loss:
   use_ssim: true
   ssim_weight: 1.0
   use_texture_loss: true # experimental, may be noisy
-  texture_weight_max: 0.05
+  texture_weight_max: 0.02 # I used this at 0.05 -> should probably test without and without it, but I think 0.02 may be good.
   texture_fade_start: 0.4
   texture_fade_end: 0.6
 
 
 ema:
   enabled: true # improves quality by updating a shadow model in kept in VRAM. Should be safe unless unless the model is massive and VRAM is extremely tight
-  decay: 0.9999 # determines EMA update speed; close to 1.0 means slow updates and more stable EMA weights
+  decay: 0.9995 # determines EMA update speed; close to 1.0 means slow updates and more stable EMA weights -> I used 0.9999, but for 100k allowing it to update faster my be beneficial. 
   validate_with_ema: true
   infer_with_ema: true
 
