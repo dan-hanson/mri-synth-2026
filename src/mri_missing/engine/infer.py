@@ -15,10 +15,9 @@ if SRC_ROOT not in sys.path:
 from mri_missing.config import load_config, ensure_dir
 from mri_missing.models.registry import build_model
 from mri_missing.diffusion.scheduler import DiffusionScheduler
-from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 from mri_missing.utils.io import load_checkpoint, save_json
 from mri_missing.utils.cases import MOD_KEYS, resolve_case_dirs
-from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_zscore, normalize_per_case_01_np, normalize_strict_bound
+from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_strict_bound
 from mri_missing.utils.visualization import save_slice_panel
 from monai.inferers import sliding_window_inference
 from mri_missing.utils.ema import EMA
@@ -28,7 +27,6 @@ from diffusers import DDIMScheduler
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
 
 
 def pad_to_multiple_3d(x, multiple=32, value=-1.0, mode="constant"):
@@ -65,9 +63,8 @@ def unpad_3d(x, pad):
 
     return x
 
+
 def prepare_condition(cfg, data_dict, missing_key):
-    '''Prepares the conditioning tensor and target for inference.
-    Handles modality masking and presence masks based on config.'''
     cond = []
     mask = []
     target = data_dict[missing_key].copy()
@@ -83,17 +80,16 @@ def prepare_condition(cfg, data_dict, missing_key):
             cond.append(data_dict[k].astype(np.float32))
             mask.append(np.ones_like(data_dict[k], dtype=np.float32))
 
-    cond = np.stack(cond, axis=0)   # [4, D, H, W]
+    cond = np.stack(cond, axis=0)  # [4, D, H, W]
 
     if use_presence_mask:
-        mask = np.stack(mask, axis=0)   # [4, D, H, W]
-        cond = np.concatenate([cond, mask], axis=0)   # [8, D, H, W]
+        mask = np.stack(mask, axis=0)  # [4, D, H, W]
+        cond = np.concatenate([cond, mask], axis=0)  # [8, D, H, W]
 
     return cond, target
 
 
 def resolve_checkpoint_path(cfg):
-    '''Determines the checkpoint path to load for inference based on config settings.'''
     ckpt_path = cfg["inference"].get("checkpoint_path")
     run_dir = cfg["inference"].get("run_dir")
     ckpt_name = cfg["inference"].get("checkpoint_name", "best.pt")
@@ -108,7 +104,6 @@ def resolve_checkpoint_path(cfg):
 
 
 def build_infer_model(cfg, device):
-    '''Builds the model for inference based on the config. Supports multiple architectures.'''
     model_name = cfg["model"]["name"].lower()
     model_kwargs = {
         "in_channels": cfg["model"]["in_channels"],
@@ -142,7 +137,6 @@ def build_infer_model(cfg, device):
         model_kwargs["attn_drop_rate"] = cfg["model"].get("attn_drop_rate", 0.0)
         model_kwargs["use_checkpoint"] = cfg["model"].get("use_checkpoint", True)
         model_kwargs["spatial_dims"] = cfg["model"].get("spatial_dims", 3)
-    # ----------------------
 
     model = build_model(model_name, **model_kwargs).to(device)
     return model
@@ -155,7 +149,6 @@ def build_available_support_mask(cond_np, missing_key):
     then uses the image channels themselves to find tissue support.
     """
     if cond_np.shape[0] >= 8:
-        # channels 4:8 are presence masks; each is all-ones or all-zeros
         available_idx = [i for i in range(4) if cond_np[4 + i].max() > 0.5]
     else:
         available_idx = [i for i, k in enumerate(MOD_KEYS) if k != missing_key]
@@ -167,20 +160,36 @@ def build_available_support_mask(cond_np, missing_key):
     return np.any(np.stack(support_masks, axis=0), axis=0)
 
 
+def make_output_dir(cfg, ckpt_path):
+    base_out = os.path.join(
+        cfg["project"]["output_root"],
+        cfg["inference"]["output_subdir"],
+        cfg["model"]["name"],
+    )
+
+    run_tag = cfg["inference"].get("run_tag")
+    if not run_tag:
+        ckpt_stem = os.path.splitext(os.path.splitext(os.path.basename(ckpt_path))[0])[0]
+        run_tag = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{ckpt_stem}_rs{cfg['inference']['reverse_steps']}"
+
+    out_dir = os.path.join(base_out, run_tag)
+    ensure_dir(out_dir)
+    return out_dir
+
+
 @torch.inference_mode()
 def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
-    '''Runs inference on a single case and returns the prediction, target, condition, and metadata.'''
     data_dict, affine, header = load_case(case_dir)
 
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
 
+    # Match the rebuilt pt cache normalization exactly.
     norm_data_dict = {}
     for k, vol in data_dict.items():
         norm_data_dict[k] = normalize_strict_bound(vol)
 
     cond_np, target_np = prepare_condition(cfg, norm_data_dict, missing_key)
 
-    # Correct leak-free support: use available IMAGE channels, not presence mask voxels
     available_mask = build_available_support_mask(cond_np, missing_key)
 
     coords = np.argwhere(available_mask)
@@ -196,7 +205,6 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     cond = torch.tensor(cond_crop[None], dtype=torch.float32, device=device)
 
-    # Pad image channels and presence-mask channels differently
     if cond.shape[1] >= 8:
         cond_img = cond[:, :4]
         cond_pres = cond[:, 4:8]
@@ -208,17 +216,13 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     else:
         cond, pad_info = pad_to_multiple_3d(cond, multiple=32, value=-1.0)
 
-    # Sample x directly at padded size instead of padding with -1
     x = torch.randn((1, 1, *cond.shape[2:]), device=device)
 
-    # beta_schedule = "squaredcos_cap_v2" if cfg["diffusion"].get("schedule") == "cosine" else "linear"
-
     trained_betas_np = diffusion.betas.detach().cpu().numpy()
-
     scheduler = DDIMScheduler(
         trained_betas=trained_betas_np,
-        clip_sample=True,          # Natively clamps x0 safely during the reverse process!
-        clip_sample_range=1.0,     # Locks it exactly to your [-1, 1] bounds
+        clip_sample=True,
+        clip_sample_range=1.0,
     )
     scheduler.set_timesteps(cfg["inference"]["reverse_steps"])
 
@@ -228,9 +232,10 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     overlap = cfg["inference"]["sliding_window"]["overlap"]
 
     start = time.time()
+    amp_enabled = (device == "cuda")
     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-    with torch.autocast(device_type="cuda", dtype=amp_dtype):
+    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
         for t_idx in scheduler.timesteps:
             t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
             t = torch.tensor([t_scalar], device=device, dtype=torch.long)
@@ -252,23 +257,16 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
             else:
                 pred_noise = model(model_in, t)
 
-            # Clean, stable 1st-order step. No manual clamping needed!
             x = scheduler.step(pred_noise, t_idx, x).prev_sample
 
     elapsed = time.time() - start
 
     x = unpad_3d(x, pad_info)
-
     pred_crop = x[0, 0].detach().float().cpu().numpy()
-
-    # --- FIX: Clamp the final clean prediction here! ---
     pred_crop = np.clip(pred_crop, -1.0, 1.0)
 
-    # Build the full volume
     pred_full = np.full_like(target_np, -1.0, dtype=np.float32)
     pred_full[d0:d1, h0:h1, w0:w1] = pred_crop
-
-    # Mask out real background correctly
     pred_full = np.where(available_mask, pred_full, -1.0)
 
     eval_mask_full = available_mask.astype(np.float32)
@@ -309,15 +307,12 @@ def main():
     infer_model = ema.shadow if (ema is not None and cfg["ema"]["infer_with_ema"]) else model
     infer_model.eval()
 
-    # --- COMPILER TRICK FOR BLACKWELL ---
     if cfg["inference"].get("use_compile", False):
         if os.name == "nt":
             print("Warning: torch.compile is not fully supported on Windows. Skipping compile.")
         else:
             print("Compiling model for Linux (max-autotune). The first volume will take a few extra minutes...")
-            # max-autotune optimizes the graph specifically for inference speed
             infer_model = torch.compile(infer_model, mode="max-autotune")
-    # ------------------------------------
 
     diffusion = DiffusionScheduler(
         timesteps=cfg["diffusion"]["timesteps"],
@@ -346,21 +341,10 @@ def main():
         random_case_seed=cfg["inference"].get("random_case_seed", 42),
     )
 
-    base_out = os.path.join(
-        cfg["project"]["output_root"],
-        cfg["inference"]["output_subdir"],
-        cfg["model"]["name"],
-    )
-    ensure_dir(base_out)
-
-    # --- FIX: SAFE JSON LOADING ---
+    base_out = make_output_dir(cfg, ckpt_path)
     summary_path = os.path.join(base_out, "summary.json")
-    if os.path.exists(summary_path):
-        with open(summary_path, "r") as f:
-            summary = json.load(f)
-    else:
-        summary = []
-    # ------------------------------
+    summary = []
+
     for case_dir in case_dirs:
         case_id = os.path.basename(case_dir)
 
@@ -413,6 +397,7 @@ def main():
             save_json(summary_path, summary)
 
     print(f"Saved inference outputs to: {base_out}")
+
 
 if __name__ == "__main__":
     main()
