@@ -9,7 +9,7 @@ if SRC_ROOT not in sys.path:
 
 from mri_missing.data.dataset import BraTSDataset
 
-DATA_ROOT = ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+DATA_ROOT = "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026-main/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
 
 dataset = BraTSDataset(DATA_ROOT)
 loader = DataLoader(dataset, batch_size=1, shuffle=True)

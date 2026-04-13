@@ -1,10 +1,29 @@
 import os
 import json
 import torch
+from collections.abc import Mapping
+
+
+def _strip_orig_mod_prefix(state_dict):
+    """
+    Removes the '_orig_mod.' prefix that can appear when saving checkpoints
+    from a torch.compile()-wrapped model.
+    """
+    if not isinstance(state_dict, Mapping):
+        return state_dict
+
+    cleaned = {}
+    for k, v in state_dict.items():
+        if isinstance(k, str) and k.startswith("_orig_mod."):
+            cleaned[k[len("_orig_mod."):]] = v
+        else:
+            cleaned[k] = v
+    return cleaned
 
 
 def save_checkpoint(path, model, optimizer, scheduler, scaler, step, best_val=None, cfg=None, ema=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -20,19 +39,15 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, step, best_val=No
     )
 
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ema=None, map_location="cpu"):
+def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ema=None, map_location="cpu", strict=True):
     ckpt = torch.load(path, map_location=map_location)
 
-    model_state = ckpt["model_state"]
+    model_state = ckpt.get("model_state")
+    if model_state is None:
+        raise KeyError(f"Checkpoint at {path} does not contain 'model_state'.")
 
-    # Handle checkpoints saved from torch.compile models
-    if any(k.startswith("_orig_mod.") for k in model_state.keys()):
-        model_state = {
-            k.replace("_orig_mod.", "", 1): v
-            for k, v in model_state.items()
-        }
-
-    model.load_state_dict(model_state)
+    model_state = _strip_orig_mod_prefix(model_state)
+    model.load_state_dict(model_state, strict=strict)
 
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -44,14 +59,7 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, em
         scaler.load_state_dict(ckpt["scaler_state"])
 
     if ema is not None and ckpt.get("ema_state") is not None:
-        ema_state = ckpt["ema_state"]
-
-        if any(k.startswith("_orig_mod.") for k in ema_state.keys()):
-            ema_state = {
-                k.replace("_orig_mod.", "", 1): v
-                for k, v in ema_state.items()
-            }
-
+        ema_state = _strip_orig_mod_prefix(ckpt["ema_state"])
         ema.load_state_dict(ema_state)
 
     return ckpt

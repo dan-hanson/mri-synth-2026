@@ -10,7 +10,7 @@ SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
 if SRC_ROOT not in sys.path:
     sys.path.append(SRC_ROOT)
 
-from mri_missing.utils.nifti import normalize_zscore
+from mri_missing.utils.nifti import normalize_zscore, normalize_strict_bound
 
 FILE_MAP = {
     "t1": "t1n",

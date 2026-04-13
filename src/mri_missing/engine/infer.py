@@ -1,9 +1,11 @@
-import os, sys
+import os
+import sys
 import time
 import json
 import torch
 import numpy as np
 from datetime import datetime
+import torch.nn.functional as F
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
@@ -16,18 +18,56 @@ from mri_missing.diffusion.scheduler import DiffusionScheduler
 from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 from mri_missing.utils.io import load_checkpoint, save_json
 from mri_missing.utils.cases import MOD_KEYS, resolve_case_dirs
-from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_zscore, normalize_per_case_01_np
+from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_zscore, normalize_per_case_01_np, normalize_strict_bound
 from mri_missing.utils.visualization import save_slice_panel
 from monai.inferers import sliding_window_inference
 from mri_missing.utils.ema import EMA
 from mri_missing.metrics.image_metrics import ImageMetricBundle
+from diffusers import DDIMScheduler
 
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
 
+
+def pad_to_multiple_3d(x, multiple=32, value=-1.0, mode="constant"):
+    """
+    x: [B, C, D, H, W]
+    Pads only on the max side of each spatial axis.
+    Returns padded tensor and pad info tuple.
+    """
+    _, _, d, h, w = x.shape
+
+    d_pad = (multiple - (d % multiple)) % multiple
+    h_pad = (multiple - (h % multiple)) % multiple
+    w_pad = (multiple - (w % multiple)) % multiple
+
+    # F.pad order for 5D is (W_left, W_right, H_left, H_right, D_left, D_right)
+    pad = (0, w_pad, 0, h_pad, 0, d_pad)
+    x_pad = F.pad(x, pad, mode=mode, value=value)
+    return x_pad, pad
+
+
+def unpad_3d(x, pad):
+    """
+    x: [B, C, D, H, W]
+    pad: (0, w_pad, 0, h_pad, 0, d_pad)
+    """
+    _, w_pad, _, h_pad, _, d_pad = pad
+
+    if d_pad > 0:
+        x = x[:, :, :-d_pad, :, :]
+    if h_pad > 0:
+        x = x[:, :, :, :-h_pad, :]
+    if w_pad > 0:
+        x = x[:, :, :, :, :-w_pad]
+
+    return x
+
 def prepare_condition(cfg, data_dict, missing_key):
+    '''Prepares the conditioning tensor and target for inference.
+    Handles modality masking and presence masks based on config.'''
     cond = []
     mask = []
     target = data_dict[missing_key].copy()
@@ -43,16 +83,17 @@ def prepare_condition(cfg, data_dict, missing_key):
             cond.append(data_dict[k].astype(np.float32))
             mask.append(np.ones_like(data_dict[k], dtype=np.float32))
 
-    cond = np.stack(cond, axis=0)  # [4, D, H, W]
+    cond = np.stack(cond, axis=0)   # [4, D, H, W]
 
     if use_presence_mask:
-        mask = np.stack(mask, axis=0)  # [4, D, H, W]
-        cond = np.concatenate([cond, mask], axis=0)  # [8, D, H, W]
+        mask = np.stack(mask, axis=0)   # [4, D, H, W]
+        cond = np.concatenate([cond, mask], axis=0)   # [8, D, H, W]
 
     return cond, target
 
 
 def resolve_checkpoint_path(cfg):
+    '''Determines the checkpoint path to load for inference based on config settings.'''
     ckpt_path = cfg["inference"].get("checkpoint_path")
     run_dir = cfg["inference"].get("run_dir")
     ckpt_name = cfg["inference"].get("checkpoint_name", "best.pt")
@@ -67,6 +108,7 @@ def resolve_checkpoint_path(cfg):
 
 
 def build_infer_model(cfg, device):
+    '''Builds the model for inference based on the config. Supports multiple architectures.'''
     model_name = cfg["model"]["name"].lower()
     model_kwargs = {
         "in_channels": cfg["model"]["in_channels"],
@@ -75,9 +117,11 @@ def build_infer_model(cfg, device):
 
     if model_name == "unet":
         model_kwargs["base_ch"] = cfg["model"]["base_ch"]
+
     elif model_name == "convnext3d":
         model_kwargs["base_dim"] = cfg["model"]["base_dim"]
-    elif model_name == "monai_diffusion_ssim":
+
+    elif model_name == "monai_diffusion":
         model_kwargs["channels"] = tuple(cfg["model"]["channels"])
         model_kwargs["attention_levels"] = tuple(cfg["model"]["attention_levels"])
         model_kwargs["num_res_blocks"] = cfg["model"]["num_res_blocks"]
@@ -88,27 +132,58 @@ def build_infer_model(cfg, device):
         model_kwargs["transformer_num_layers"] = cfg["model"].get("transformer_num_layers", 1)
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
 
+    elif model_name == "swin_ddpm":
+        model_kwargs["img_size"] = tuple(cfg["patch"]["size"])
+        model_kwargs["feature_size"] = cfg["model"].get("feature_size", 48)
+        model_kwargs["depths"] = tuple(cfg["model"].get("depths", [2, 2, 2, 2]))
+        model_kwargs["num_heads"] = tuple(cfg["model"].get("num_heads", [4, 4, 8, 16]))
+        model_kwargs["window_size"] = tuple(cfg["model"].get("window_size", [4, 4, 4]))
+        model_kwargs["drop_rate"] = cfg["model"].get("drop_rate", 0.0)
+        model_kwargs["attn_drop_rate"] = cfg["model"].get("attn_drop_rate", 0.0)
+        model_kwargs["use_checkpoint"] = cfg["model"].get("use_checkpoint", True)
+        model_kwargs["spatial_dims"] = cfg["model"].get("spatial_dims", 3)
+    # ----------------------
+
     model = build_model(model_name, **model_kwargs).to(device)
     return model
 
 
+def build_available_support_mask(cond_np, missing_key):
+    """
+    cond_np: [4 or 8, D, H, W]
+    Uses presence masks only to identify WHICH modality slots are available,
+    then uses the image channels themselves to find tissue support.
+    """
+    if cond_np.shape[0] >= 8:
+        # channels 4:8 are presence masks; each is all-ones or all-zeros
+        available_idx = [i for i in range(4) if cond_np[4 + i].max() > 0.5]
+    else:
+        available_idx = [i for i, k in enumerate(MOD_KEYS) if k != missing_key]
+
+    if len(available_idx) == 0:
+        raise ValueError("No available input modalities found to build support mask.")
+
+    support_masks = [(cond_np[i] > -0.999) for i in available_idx]
+    return np.any(np.stack(support_masks, axis=0), axis=0)
+
+
 @torch.inference_mode()
 def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
+    '''Runs inference on a single case and returns the prediction, target, condition, and metadata.'''
     data_dict, affine, header = load_case(case_dir)
 
-    # 1. Preserve the absolute native scanner intensities
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
-    raw_target = raw_data_dict[missing_key]
-    raw_min, raw_max = raw_target.min(), raw_target.max()
 
-    # 2. Apply Z-Score so the model gets the distribution it was trained on
-    for k in data_dict:
-        data_dict[k] = normalize_zscore(data_dict[k])
+    norm_data_dict = {}
+    for k, vol in data_dict.items():
+        norm_data_dict[k] = normalize_strict_bound(vol)
 
-    cond_np, target_np = prepare_condition(cfg, data_dict, missing_key)
+    cond_np, target_np = prepare_condition(cfg, norm_data_dict, missing_key)
 
-    mask = target_np > target_np.min()
-    coords = np.argwhere(mask)
+    # Correct leak-free support: use available IMAGE channels, not presence mask voxels
+    available_mask = build_available_support_mask(cond_np, missing_key)
+
+    coords = np.argwhere(available_mask)
     if len(coords) > 0:
         d0, h0, w0 = coords.min(axis=0)
         d1, h1, w1 = coords.max(axis=0) + 1
@@ -120,33 +195,51 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     target_crop = target_np[d0:d1, h0:h1, w0:w1]
 
     cond = torch.tensor(cond_crop[None], dtype=torch.float32, device=device)
-    x = torch.randn((1, 1, *target_crop.shape), device=device)
 
-    reverse_steps = cfg["inference"]["reverse_steps"]
-    total_train_steps = cfg["diffusion"]["timesteps"]
+    # Pad image channels and presence-mask channels differently
+    if cond.shape[1] >= 8:
+        cond_img = cond[:, :4]
+        cond_pres = cond[:, 4:8]
 
-    if reverse_steps >= total_train_steps:
-        t_schedule = list(reversed(range(total_train_steps)))
+        cond_img, pad_info = pad_to_multiple_3d(cond_img, multiple=32, value=-1.0)
+        cond_pres, _ = pad_to_multiple_3d(cond_pres, multiple=32, value=0.0, mode="replicate")
+
+        cond = torch.cat([cond_img, cond_pres], dim=1)
     else:
-        idxs = np.linspace(0, total_train_steps - 1, reverse_steps, dtype=int)
-        t_schedule = list(reversed(idxs.tolist()))
+        cond, pad_info = pad_to_multiple_3d(cond, multiple=32, value=-1.0)
+
+    # Sample x directly at padded size instead of padding with -1
+    x = torch.randn((1, 1, *cond.shape[2:]), device=device)
+
+    # beta_schedule = "squaredcos_cap_v2" if cfg["diffusion"].get("schedule") == "cosine" else "linear"
+
+    trained_betas_np = diffusion.betas.detach().cpu().numpy()
+
+    scheduler = DDIMScheduler(
+        trained_betas=trained_betas_np,
+        clip_sample=True,          # Natively clamps x0 safely during the reverse process!
+        clip_sample_range=1.0,     # Locks it exactly to your [-1, 1] bounds
+    )
+    scheduler.set_timesteps(cfg["inference"]["reverse_steps"])
 
     use_sw = cfg["inference"]["sliding_window"]["enabled"]
-    roi_size = tuple(int(x) for x in cfg["inference"]["sliding_window"]["roi_size"])
+    roi_size = tuple(int(v) for v in cfg["inference"]["sliding_window"]["roi_size"])
     sw_batch_size = cfg["inference"]["sliding_window"]["sw_batch_size"]
     overlap = cfg["inference"]["sliding_window"]["overlap"]
 
     start = time.time()
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
     with torch.autocast(device_type="cuda", dtype=amp_dtype):
-        for i, t_idx in enumerate(t_schedule):
-            t = torch.tensor([t_idx], device=device, dtype=torch.long)
+        for t_idx in scheduler.timesteps:
+            t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
+            t = torch.tensor([t_scalar], device=device, dtype=torch.long)
+
             model_in = torch.cat([cond, x], dim=1)
 
             if use_sw:
-                def predictor(patch_x):
-                    return model(patch_x, t)
+                def predictor(patch_in):
+                    return model(patch_in, t)
 
                 pred_noise = sliding_window_inference(
                     inputs=model_in,
@@ -154,46 +247,43 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
                     sw_batch_size=sw_batch_size,
                     predictor=predictor,
                     overlap=overlap,
-                    mode="gaussian"
+                    mode="gaussian",
                 )
             else:
                 pred_noise = model(model_in, t)
 
-            alpha_bar_t = diffusion.alpha_cumprod[t_idx].view(1, 1, 1, 1, 1)
-
-            if i < len(t_schedule) - 1:
-                t_prev = t_schedule[i + 1]
-                alpha_bar_prev = diffusion.alpha_cumprod[t_prev].view(1, 1, 1, 1, 1)
-            else:
-                alpha_bar_prev = torch.ones_like(alpha_bar_t)
-
-            pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
-            pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
-
-            x = torch.sqrt(alpha_bar_prev) * pred_x0 + torch.sqrt(1 - alpha_bar_prev) * pred_noise
+            # Clean, stable 1st-order step. No manual clamping needed!
+            x = scheduler.step(pred_noise, t_idx, x).prev_sample
 
     elapsed = time.time() - start
 
-    # --- THE INTENSITY FIX ---
-    # 1. Grab the model's Z-scored prediction
-    pred_cropped = x[0, 0].detach().cpu().numpy()
+    x = unpad_3d(x, pad_info)
 
-    # 2. Map the Z-score exactly to a [0, 1] range safely
-    pred_cropped_01 = normalize_per_case_01_np(pred_cropped)
+    pred_crop = x[0, 0].detach().float().cpu().numpy()
 
-    # 3. Upscale the [0, 1] brain back to Native Scanner space (e.g., 0 to 2500)
-    pred_native = (pred_cropped_01 * (raw_max - raw_min)) + raw_min
+    # --- FIX: Clamp the final clean prediction here! ---
+    pred_crop = np.clip(pred_crop, -1.0, 1.0)
 
-    # Create empty background using the native target shape
-    pred_full = np.zeros_like(raw_target)
-    pred_full[d0:d1, h0:h1, w0:w1] = pred_native
+    # Build the full volume
+    pred_full = np.full_like(target_np, -1.0, dtype=np.float32)
+    pred_full[d0:d1, h0:h1, w0:w1] = pred_crop
 
-    # 4. Mask the native background (which is purely 0.0)
-    brain_mask = raw_target > raw_target.min()
-    pred_full = pred_full * brain_mask
+    # Mask out real background correctly
+    pred_full = np.where(available_mask, pred_full, -1.0)
 
-    # CRITICAL: Return `raw_target` instead of `target_np`!
-    return pred_full, raw_target, cond_np, affine, header, elapsed, raw_data_dict
+    eval_mask_full = available_mask.astype(np.float32)
+
+    return (
+        pred_full.astype(np.float32),
+        target_np.astype(np.float32),
+        cond_np.astype(np.float32),
+        affine,
+        header,
+        elapsed,
+        norm_data_dict,
+        raw_data_dict,
+        eval_mask_full,
+    )
 
 
 def main():
@@ -256,17 +346,10 @@ def main():
         random_case_seed=cfg["inference"].get("random_case_seed", 42),
     )
 
-    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt_stem = os.path.splitext(os.path.basename(ckpt_path))[0]
-    run_name = cfg["inference"].get("run_name")
-    if not run_name:
-        run_name = f"{run_tag}_{ckpt_stem}"
-
     base_out = os.path.join(
         cfg["project"]["output_root"],
         cfg["inference"]["output_subdir"],
         cfg["model"]["name"],
-        run_name,
     )
     ensure_dir(base_out)
 
@@ -278,18 +361,17 @@ def main():
     else:
         summary = []
     # ------------------------------
-
     for case_dir in case_dirs:
         case_id = os.path.basename(case_dir)
 
         for missing_key in missing_keys:
-            pred, target, cond, affine, header, elapsed, raw_data_dict = infer_single_case(
+            pred, target, cond, affine, header, elapsed, norm_data_dict, raw_data_dict, eval_mask = infer_single_case(
                 cfg, infer_model, diffusion, case_dir, missing_key, device
             )
 
             pred_t = torch.tensor(pred[None, None], dtype=torch.float32)
             target_t = torch.tensor(target[None, None], dtype=torch.float32)
-            mask_t = torch.tensor((target > target.min())[None, None], dtype=torch.float32)
+            mask_t = torch.tensor(eval_mask[None, None], dtype=torch.float32)
 
             infer_metrics = metric_bundle(pred_t, target_t, mask=mask_t)
 
@@ -306,9 +388,9 @@ def main():
                         if k == missing_key:
                             composite.append(pred)
                         else:
-                            composite.append(raw_data_dict[k])
+                            composite.append(norm_data_dict[k])
 
-                    composite = np.stack(composite, axis=0)
+                    composite = np.stack(composite, axis=0).astype(np.float32)
                     comp_path = os.path.join(item_dir, f"{case_id}_composite_{missing_key}.nii.gz")
                     save_prediction_nifti(composite, affine, header, comp_path)
 
@@ -316,7 +398,6 @@ def main():
                 png_path = os.path.join(item_dir, f"{case_id}_panel_{missing_key}.png")
                 save_slice_panel(cond, target, pred, png_path, missing_key=missing_key, title=f"{case_id}")
 
-            # --- FIX: ADDED METADATA & APPEND ---
             summary.append({
                 "case_id": case_id,
                 "missing_key": missing_key,
@@ -327,15 +408,11 @@ def main():
                 "roi_size": cfg["inference"]["sliding_window"]["roi_size"],
                 **infer_metrics,
             })
-            # ------------------------------------
 
             print(f"[infer] case={case_id} missing={missing_key} time={elapsed:.2f}s")
-
-            # Save incrementally inside the loop so you don't lose data if it crashes
             save_json(summary_path, summary)
 
     print(f"Saved inference outputs to: {base_out}")
-
 
 if __name__ == "__main__":
     main()

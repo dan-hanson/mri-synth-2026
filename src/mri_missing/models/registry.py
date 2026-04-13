@@ -12,10 +12,14 @@ def build_model(name: str, **kwargs):
         return ConvNeXt3DDenoiser(**kwargs)
 
     elif name == "swin":
-        from mri_missing.models.swin_wrapper import SwinDenoiser
-        return SwinDenoiser(**kwargs)
+        from mri_missing.models.swinUNETR import SwinUNETRWrapper
+        return SwinUNETRWrapper(**kwargs)
 
-    elif name == "monai_diffusion_ssim":
+    elif name == "swin_ddpm":
+        from mri_missing.models.swin_UNTR_DDPM import SwinUNETR
+        return SwinUNETR(**kwargs)
+
+    elif name == "monai_diffusion":
         from mri_missing.models.monai_diffusion import MonaiDiffusionWrapper
         return MonaiDiffusionWrapper(**kwargs)
 
