@@ -6,7 +6,12 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import concurrent.futures
 
-sys.path.append(r"C:\mri_synth_2026\src")
+import os, sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.append(SRC_ROOT)
 
 from mri_missing.config import load_config, ensure_dir, make_run_dir, save_config_copy
 from mri_missing.seed import seed_everything
@@ -50,15 +55,18 @@ def build_scheduler(cfg, optimizer):
         )
     elif name == "constant_with_warmup":
         warmup_steps = cfg["scheduler"].get("warmup_steps", 2500)
+
         def lr_lambda(current_step):
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
             return 1.0  # Stay flat after warmup
+
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif name == "none":
         return None
     else:
         raise ValueError(f"Unknown scheduler: {name}")
+
 
 def should_stop(run_dir, cfg):
     stop_file = cfg.get("control", {}).get("stop_file", "STOP")
@@ -97,7 +105,7 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and device == "cuda"):
             pred_noise = model(x_in, t)
-    
+
         alpha_bar = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
         snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
 
@@ -118,37 +126,37 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
         if compute_heavy:
             # Start from pure static noise
             x_gen = torch.randn_like(target)
-            
+
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and device == "cuda"):
                 for i, t_idx in enumerate(t_schedule):
                     t_tensor = torch.full((cond.shape[0],), t_idx, device=device, dtype=torch.long)
                     model_in = torch.cat([cond, x_gen], dim=1)
-                    
+
                     p_noise = model(model_in, t_tensor)
-                    
+
                     a_bar_t = scheduler.alpha_cumprod[t_idx].view(-1, 1, 1, 1, 1)
                     if i < len(t_schedule) - 1:
-                        t_prev = t_schedule[i+1]
+                        t_prev = t_schedule[i + 1]
                         a_bar_prev = scheduler.alpha_cumprod[t_prev].view(-1, 1, 1, 1, 1)
                     else:
                         a_bar_prev = torch.ones_like(a_bar_t)
 
                     p_x0 = (x_gen - torch.sqrt(1 - a_bar_t) * p_noise) / torch.sqrt(a_bar_t)
                     p_x0 = torch.clamp(p_x0, min=-3.0, max=3.0)
-                    
+
                     x_gen = torch.sqrt(a_bar_prev) * p_x0 + torch.sqrt(1 - a_bar_prev) * p_noise
 
-            # Calculate Clinical Metrics on the FULLY GENERATED patch
+            # Calculate Clinical Past_Metrics_Configs on the FULLY GENERATED patch
             for b in range(target.shape[0]):
                 # Extract the exact string modality for this specific item in the batch
                 mod = keys[b] if isinstance(keys, (list, tuple)) else keys
-                
+
                 # Slice the batch to isolate this specific brain
-                p_b = x_gen[b:b+1]
-                t_b = target[b:b+1]
-                
+                p_b = x_gen[b:b + 1]
+                t_b = target[b:b + 1]
+
                 metrics = metric_bundle(p_b, t_b)
-                
+
                 # Sort metrics globally and into their specific modality bucket
                 for k, v in metrics.items():
                     metric_accum.setdefault(k, []).append(v)
@@ -160,7 +168,7 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
     if compute_heavy:
         for k, vals in metric_accum.items():
             out[f"val_{k}"] = sum(vals) / max(len(vals), 1)
-        
+
         for mod, m_dict in modality_metrics.items():
             for k, vals in m_dict.items():
                 out[f"val_{mod}_{k}"] = sum(vals) / max(len(vals), 1)
@@ -204,15 +212,15 @@ def main():
     val_aug_cfg["enabled"] = False
 
     val_ds = BraTSDataset(
-            cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
-            patch_size=tuple(cfg["patch"]["size"]),
-            fill_value=cfg["missing_policy"]["fill_value"],
-            use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
-            # Force Validation to ONLY test the hard modalities
-            sampling_probs={"t1": 0.0, "t1ce": 0.5, "t2": 0.0, "flair": 0.5},
-            backend=cfg["data"]["backend"],
-            augmentation=val_aug_cfg,
-        )
+        cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
+        patch_size=tuple(cfg["patch"]["size"]),
+        fill_value=cfg["missing_policy"]["fill_value"],
+        use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
+        # Force Validation to ONLY test the hard modalities
+        sampling_probs={"t1": 0.0, "t1ce": 0.5, "t2": 0.0, "flair": 0.5},
+        backend=cfg["data"]["backend"],
+        augmentation=val_aug_cfg,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -233,26 +241,26 @@ def main():
     )
 
     # --- VAL MICRO-BATCH ---
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Extracting Validation Micro-Batch...")
     golden_batches = []
-    
+
     # Notice the updated unpacking: added case_ids
     for cond, target, keys, case_ids in val_loader:
         golden_batches.append((cond.clone(), target.clone(), keys, case_ids))
-        if len(golden_batches) >= 4: 
+        if len(golden_batches) >= 4:
             break
 
     print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
-    
+
     # Print the exact Case IDs and their assigned missing modality
     for b_idx, (_, _, keys, case_ids) in enumerate(golden_batches):
         for i in range(len(keys)):
             mod = keys[i] if isinstance(keys, (list, tuple)) else keys
             c_id = case_ids[i] if isinstance(case_ids, (list, tuple)) else case_ids
             print(f"  -> {c_id} [Missing: {mod.upper()}]")
-            
-    print("="*60 + "\n")
+
+    print("=" * 60 + "\n")
     # ------------------------------
 
     model_name = cfg["model"]["name"].lower()
@@ -267,7 +275,7 @@ def main():
     elif model_name == "convnext3d":
         model_kwargs["base_dim"] = cfg["model"]["base_dim"]
 
-    elif model_name == "monai_diffusion":
+    elif model_name == "monai_diffusion_ssim":
         model_kwargs["channels"] = tuple(cfg["model"]["channels"])
         model_kwargs["attention_levels"] = tuple(cfg["model"]["attention_levels"])
         model_kwargs["num_res_blocks"] = cfg["model"]["num_res_blocks"]
@@ -310,7 +318,7 @@ def main():
         beta_end=cfg["diffusion"]["beta_end"],
     ).to(device)
 
-    # time_embed = SinusoidalTimeEmbedding(128).to(device) -> not needed for monai_diffusion
+    # time_embed = SinusoidalTimeEmbedding(128).to(device) -> not needed for monai_diffusion_ssim
 
     metric_bundle = ImageMetricBundle(
         compute_mae=cfg["metrics"]["compute_mae"],
@@ -321,7 +329,7 @@ def main():
 
     start_step = 0
     best_val = float("inf")
-    best_ssim = -float("inf") # track best SSIM separately for clinical checkpoint
+    best_ssim = -float("inf")  # track best SSIM separately for clinical checkpoint
 
     if cfg["train"]["resume"]:
         ckpt = load_checkpoint(
@@ -351,7 +359,7 @@ def main():
 
     # Fetch config value (default to 1 if missing)
     accum_steps = cfg["train"].get("accumulate_grad_batches", 1)
-    
+
     # Initialize zero gradients before the loop starts
     optimizer.zero_grad(set_to_none=True)
 
@@ -379,7 +387,7 @@ def main():
 
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.q_sample(target, t)
-                # t_emb = time_embed(t.float()) -> not needed for monai_diffusion
+                # t_emb = time_embed(t.float()) -> not needed for monai_diffusion_ssim
                 x = torch.cat([cond, x_t], dim=1)
 
                 with torch.amp.autocast("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda"):
@@ -392,8 +400,8 @@ def main():
                 snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
 
                 pred_x0 = (
-                    x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
-                ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
+                                  x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
+                          ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
                 # Prevent extreme mathematical outliers from shattering the gradients
                 pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
@@ -409,7 +417,8 @@ def main():
                 )
 
                 # --- SAFETY CHECKS BEFORE BACKWARD ---
-                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(pred_x0).all():
+                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(
+                        pred_x0).all():
                     print(f"NaN detected at step={step}. Saving debug checkpoint...")
                     save_checkpoint(
                         os.path.join(ckpt_dir, "nan_debug.pt"),
@@ -428,13 +437,13 @@ def main():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
-                    
+
                     # Zero gradients AFTER stepping
                     optimizer.zero_grad(set_to_none=True)
-                    
+
                     if ema is not None:
                         ema.update(model)
-                    
+
                     if scheduler_lr is not None:
                         scheduler_lr.step()
 
@@ -476,11 +485,11 @@ def main():
 
                 if do_light_val or do_heavy_val:
                     val_model = ema.shadow if (ema is not None and cfg["ema"]["validate_with_ema"]) else model
-                    
+
                     # Pass the golden_batches to BOTH light and heavy validation
                     val_stats = validate(
                         val_model,
-                        golden_batches, 
+                        golden_batches,
                         diffusion,
                         loss_fn,
                         metric_bundle,
@@ -506,26 +515,29 @@ def main():
 
                     # --- CONSOLE UI ---
                     prefix = "Val Heavy" if do_heavy_val else "Val Light"
-                    print(f"\n{'='*12} [ {prefix} ] {'='*12}")
-                    
+                    print(f"\n{'=' * 12} [ {prefix} ] {'=' * 12}")
+
                     t_loss = val_stats.get('val_total_loss', 0)
                     n_mse = val_stats.get('val_noise_mse', 0)
                     m_loss = val_stats.get('val_mae_loss', 0)
                     s_loss = val_stats.get('val_ssim_loss', 0)
-                    
+
                     if do_heavy_val:
-                        print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
-                        print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
+                        print(
+                            f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
+                        print(
+                            f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
                         print("-" * 65)
-                        
+
                         for mod in ["t1ce", "flair"]:
                             if f"val_{mod}_ssim" in val_stats:
-                                print(f"[{mod.upper():>5}] PSNR: {val_stats[f'val_{mod}_psnr']:>7.4f}  |  SSIM: {val_stats[f'val_{mod}_ssim']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_mae']:>7.4f}")
-                        print(f"{'='*50}\n")
+                                print(
+                                    f"[{mod.upper():>5}] PSNR: {val_stats[f'val_{mod}_psnr']:>7.4f}  |  SSIM: {val_stats[f'val_{mod}_ssim']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_mae']:>7.4f}")
+                        print(f"{'=' * 50}\n")
                     else:
                         print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}")
                         print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}")
-                        print(f"{'='*46}\n")
+                        print(f"{'=' * 46}\n")
 
                     # --- DUAL CHECKPOINTING ---
                     # Save the Math Checkpoint (Noise) - Updates on Light AND Heavy
@@ -536,7 +548,7 @@ def main():
                             model, optimizer, scheduler_lr, scaler,
                             step, best_val, cfg, ema=ema
                         )
-                    
+
                     # Save the Clinical Checkpoint (Structure) - Updates ONLY on Heavy
                     if "val_ssim" in val_stats and val_stats["val_ssim"] > best_ssim:
                         best_ssim = val_stats["val_ssim"]
@@ -587,6 +599,7 @@ def main():
             step, best_val, cfg, ema=ema
         )
         print("Saved interrupt checkpoint.")
+
 
 if __name__ == "__main__":
     main()

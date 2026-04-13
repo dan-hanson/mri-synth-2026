@@ -1,11 +1,14 @@
-import os
-import sys
+import os, sys
 import time
 import json
 import torch
 import numpy as np
+from datetime import datetime
 
-sys.path.append(r"C:\mri_synth_2026\src")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.append(SRC_ROOT)
 
 from mri_missing.config import load_config, ensure_dir
 from mri_missing.models.registry import build_model
@@ -23,6 +26,7 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+
 def prepare_condition(cfg, data_dict, missing_key):
     cond = []
     mask = []
@@ -39,11 +43,11 @@ def prepare_condition(cfg, data_dict, missing_key):
             cond.append(data_dict[k].astype(np.float32))
             mask.append(np.ones_like(data_dict[k], dtype=np.float32))
 
-    cond = np.stack(cond, axis=0)   # [4, D, H, W]
+    cond = np.stack(cond, axis=0)  # [4, D, H, W]
 
     if use_presence_mask:
-        mask = np.stack(mask, axis=0)   # [4, D, H, W]
-        cond = np.concatenate([cond, mask], axis=0)   # [8, D, H, W]
+        mask = np.stack(mask, axis=0)  # [4, D, H, W]
+        cond = np.concatenate([cond, mask], axis=0)  # [8, D, H, W]
 
     return cond, target
 
@@ -73,7 +77,7 @@ def build_infer_model(cfg, device):
         model_kwargs["base_ch"] = cfg["model"]["base_ch"]
     elif model_name == "convnext3d":
         model_kwargs["base_dim"] = cfg["model"]["base_dim"]
-    elif model_name == "monai_diffusion":
+    elif model_name == "monai_diffusion_ssim":
         model_kwargs["channels"] = tuple(cfg["model"]["channels"])
         model_kwargs["attention_levels"] = tuple(cfg["model"]["attention_levels"])
         model_kwargs["num_res_blocks"] = cfg["model"]["num_res_blocks"]
@@ -95,23 +99,16 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     # 1. Preserve the absolute native scanner intensities
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
     raw_target = raw_data_dict[missing_key]
-    
-    # Extract the binary brain mask
-    brain_mask = raw_target > raw_target.min()
+    raw_min, raw_max = raw_target.min(), raw_target.max()
 
-    # 2. Capture the exact statistics of the target BEFORE normalization
-    # save these to un-z-score the prediction later
-    target_fg = raw_target[brain_mask]
-    target_mean = target_fg.mean() if len(target_fg) > 0 else 0.0
-    target_std = target_fg.std() if len(target_fg) > 0 else 1.0
-    
-    # 3. Apply Z-Score function
+    # 2. Apply Z-Score so the model gets the distribution it was trained on
     for k in data_dict:
         data_dict[k] = normalize_zscore(data_dict[k])
 
     cond_np, target_np = prepare_condition(cfg, data_dict, missing_key)
 
-    coords = np.argwhere(brain_mask)
+    mask = target_np > target_np.min()
+    coords = np.argwhere(mask)
     if len(coords) > 0:
         d0, h0, w0 = coords.min(axis=0)
         d1, h1, w1 = coords.max(axis=0) + 1
@@ -145,7 +142,7 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     with torch.autocast(device_type="cuda", dtype=amp_dtype):
         for i, t_idx in enumerate(t_schedule):
             t = torch.tensor([t_idx], device=device, dtype=torch.long)
-            model_in = torch.cat([cond, x], dim=1)  
+            model_in = torch.cat([cond, x], dim=1)
 
             if use_sw:
                 def predictor(patch_x):
@@ -157,7 +154,7 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
                     sw_batch_size=sw_batch_size,
                     predictor=predictor,
                     overlap=overlap,
-                    mode="gaussian" 
+                    mode="gaussian"
                 )
             else:
                 pred_noise = model(model_in, t)
@@ -165,32 +162,37 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
             alpha_bar_t = diffusion.alpha_cumprod[t_idx].view(1, 1, 1, 1, 1)
 
             if i < len(t_schedule) - 1:
-                t_prev = t_schedule[i+1]
+                t_prev = t_schedule[i + 1]
                 alpha_bar_prev = diffusion.alpha_cumprod[t_prev].view(1, 1, 1, 1, 1)
             else:
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
 
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
-            pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0) 
-            
+            pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
+
             x = torch.sqrt(alpha_bar_prev) * pred_x0 + torch.sqrt(1 - alpha_bar_prev) * pred_noise
 
     elapsed = time.time() - start
 
-    # --- INTENSITY FIX ---
+    # --- THE INTENSITY FIX ---
     # 1. Grab the model's Z-scored prediction
     pred_cropped = x[0, 0].detach().cpu().numpy()
-    
-    # 2. Mathematically un-Z-score using the exact target statistics we saved
-    pred_native = (pred_cropped * target_std) + target_mean
 
-    # 3. Create empty background using the native target shape
+    # 2. Map the Z-score exactly to a [0, 1] range safely
+    pred_cropped_01 = normalize_per_case_01_np(pred_cropped)
+
+    # 3. Upscale the [0, 1] brain back to Native Scanner space (e.g., 0 to 2500)
+    pred_native = (pred_cropped_01 * (raw_max - raw_min)) + raw_min
+
+    # Create empty background using the native target shape
     pred_full = np.zeros_like(raw_target)
     pred_full[d0:d1, h0:h1, w0:w1] = pred_native
-    
-    # 4. Enforce the binary brain mask to eliminate the red background tint
+
+    # 4. Mask the native background (which is purely 0.0)
+    brain_mask = raw_target > raw_target.min()
     pred_full = pred_full * brain_mask
 
+    # CRITICAL: Return `raw_target` instead of `target_np`!
     return pred_full, raw_target, cond_np, affine, header, elapsed, raw_data_dict
 
 
@@ -254,10 +256,17 @@ def main():
         random_case_seed=cfg["inference"].get("random_case_seed", 42),
     )
 
+    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+    run_name = cfg["inference"].get("run_name")
+    if not run_name:
+        run_name = f"{run_tag}_{ckpt_stem}"
+
     base_out = os.path.join(
         cfg["project"]["output_root"],
         cfg["inference"]["output_subdir"],
         cfg["model"]["name"],
+        run_name,
     )
     ensure_dir(base_out)
 
@@ -281,7 +290,7 @@ def main():
             pred_t = torch.tensor(pred[None, None], dtype=torch.float32)
             target_t = torch.tensor(target[None, None], dtype=torch.float32)
             mask_t = torch.tensor((target > target.min())[None, None], dtype=torch.float32)
-            
+
             infer_metrics = metric_bundle(pred_t, target_t, mask=mask_t)
 
             item_dir = os.path.join(base_out, f"{case_id}_{missing_key}")
@@ -295,10 +304,10 @@ def main():
                     composite = []
                     for k in MOD_KEYS:
                         if k == missing_key:
-                            composite.append(pred) 
+                            composite.append(pred)
                         else:
-                            composite.append(raw_data_dict[k]) 
-                    
+                            composite.append(raw_data_dict[k])
+
                     composite = np.stack(composite, axis=0)
                     comp_path = os.path.join(item_dir, f"{case_id}_composite_{missing_key}.nii.gz")
                     save_prediction_nifti(composite, affine, header, comp_path)
@@ -321,11 +330,12 @@ def main():
             # ------------------------------------
 
             print(f"[infer] case={case_id} missing={missing_key} time={elapsed:.2f}s")
-            
+
             # Save incrementally inside the loop so you don't lose data if it crashes
             save_json(summary_path, summary)
 
     print(f"Saved inference outputs to: {base_out}")
+
 
 if __name__ == "__main__":
     main()

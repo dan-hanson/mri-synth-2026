@@ -3,19 +3,19 @@ project:
   output_root: outputs
   run_name: null   # if null, auto-generate
 
-mode: train   # train | infer
+mode: infer   # train | infer
 
 seed:
   value: 42
   deterministic: false
 
 data:
-  train_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
-  val_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData
+  train_root: ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+  val_root: ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
 
   backend: pt_cache   # nifti | pt_cache
-  train_cache_root: C:/mri_synth_2026/cache/train
-  val_cache_root: C:/mri_synth_2026/cache/val
+  train_cache_root: ".../cache/train"
+  val_cache_root: ".../cache/val"
 
 loader:
   batch_size: 1
@@ -25,10 +25,10 @@ loader:
   persistent_workers: true
 
 patch:
-  size: [96, 96, 32]
+  size: [96, 96, 64]
 
 model:
-  name: monai_diffusion
+  name: monai_diffusion_ssim
   in_channels: 9
   out_channels: 1
 
@@ -36,7 +36,7 @@ model:
   attention_levels: [false, false, true, true]
   num_res_blocks: 2
   num_head_channels: 32
-  
+
   norm_num_groups: 32
   norm_eps: 1.0e-6
   resblock_updown: false
@@ -70,24 +70,24 @@ augmentation:
   rotation_max_deg: 15
 
 train:
-  max_steps: 100000
+  max_steps: 140000
   accumulate_grad_batches: 4
   save_every: 1000
   log_every: 1000
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
-  resume: # path to checkpoint or null
+  resume: ".../outputs/20260409_155232_monai_diffusion/checkpoints/latest.pt" # path to checkpoint or null
 
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260408_000923_monai_diffusion"
-  checkpoint_name: best.pt
-  data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
-  case_ids: []
-  random_case_count: 1
+  run_dir: "outputs/20260411_144131_monai_diffusion_ssim"
+  checkpoint_name: "best_ssim.pt"
+  data_root:  ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  case_ids: ["BraTS-GLI-00001-000"]
+  random_case_count: 0
   random_case_seed: 42
-  missing_keys: ["t1"] # e.g. ["t1", "t1ce", "t2", "flair"]
+  missing_keys: ["t1ce"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
   save_nifti: true
   save_composite_nifti: true
@@ -96,14 +96,14 @@ inference:
 
   sliding_window:
     enabled: true
-    roi_size: [96, 96, 32]
+    roi_size: [96, 96, 64]
     sw_batch_size: 2
     overlap: 0.50
 
 validation:
   light_every: 100000
   heavy_every: 3000
-  
+
 runtime:
   device: cuda
   cudnn_benchmark: true

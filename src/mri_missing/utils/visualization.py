@@ -46,7 +46,7 @@ def save_history_plots(history, out_dir):
             plt.plot(heavy_steps, ssim_vals, label="ssim")
 
         plt.xlabel("step")
-        plt.title("Validation Metrics")
+        plt.title("Validation Past_Metrics_Configs")
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, "val_metrics.png"))

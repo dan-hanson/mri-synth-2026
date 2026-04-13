@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+../.venv/
+venv/
+env/
+
+# MRI / medical imaging data
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.nrrd
+*.dcm
+data/
+datasets/
+data/GLI/
+
+# Training artifacts
+outputs/
+logs/
+checkpoints/
+runs/
+wandb/
+tensorboard/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Secrets / configs
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+secrets.*
+auth.*
+token.*
+config.local.*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

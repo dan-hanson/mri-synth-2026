@@ -5,7 +5,11 @@ import nibabel as nib
 import numpy as np
 from tqdm import tqdm
 
-sys.path.append(r"C:\mri_synth_2026\src")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.append(SRC_ROOT)
+
 from mri_missing.utils.nifti import normalize_zscore
 
 FILE_MAP = {
@@ -57,11 +61,22 @@ def preprocess_split(input_root: str, output_root: str):
         )
 
 def main():
-    train_root = r"C:\mri_synth_2026\data\GLI\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
-    val_root = r"C:\mri_synth_2026\data\GLI\ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+    train_root = os.path.join(
+        PROJECT_ROOT, "data", "GLI",
+        "ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+    )
+    val_root = os.path.join(
+        PROJECT_ROOT, "data", "GLI",
+        "ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+    )
 
-    train_cache = r"C:\mri_synth_2026\cache\train"
-    val_cache = r"C:\mri_synth_2026\cache\val"
+    train_cache = os.path.join(PROJECT_ROOT, "cache", "train")
+    val_cache = os.path.join(PROJECT_ROOT, "cache", "val")
+
+    print("PROJECT_ROOT:", PROJECT_ROOT)
+    print("SRC_ROOT exists:", os.path.exists(SRC_ROOT))
+    print("TRAIN ROOT exists:", os.path.exists(train_root))
+    print("VAL ROOT exists:", os.path.exists(val_root))
 
     preprocess_split(train_root, train_cache)
     preprocess_split(val_root, val_cache)

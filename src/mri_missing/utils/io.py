@@ -22,7 +22,17 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, step, best_val=No
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ema=None, map_location="cpu"):
     ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model_state"])
+
+    model_state = ckpt["model_state"]
+
+    # Handle checkpoints saved from torch.compile models
+    if any(k.startswith("_orig_mod.") for k in model_state.keys()):
+        model_state = {
+            k.replace("_orig_mod.", "", 1): v
+            for k, v in model_state.items()
+        }
+
+    model.load_state_dict(model_state)
 
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -34,7 +44,15 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, em
         scaler.load_state_dict(ckpt["scaler_state"])
 
     if ema is not None and ckpt.get("ema_state") is not None:
-        ema.load_state_dict(ckpt["ema_state"])
+        ema_state = ckpt["ema_state"]
+
+        if any(k.startswith("_orig_mod.") for k in ema_state.keys()):
+            ema_state = {
+                k.replace("_orig_mod.", "", 1): v
+                for k, v in ema_state.items()
+            }
+
+        ema.load_state_dict(ema_state)
 
     return ckpt
 
