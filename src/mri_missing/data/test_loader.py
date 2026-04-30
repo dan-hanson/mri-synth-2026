@@ -14,10 +14,11 @@ DATA_ROOT = "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-
 dataset = BraTSDataset(DATA_ROOT)
 loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-for cond, target, key, target_idx, case_id in loader:
+for cond, target, tumor_mask, key, target_idx, case_id in loader:
     print("Condition:  ", cond.shape)
     print("Target:     ", target.shape)
+    print("Tumor mask: ", tumor_mask.shape, "fraction:", tumor_mask.float().mean().item())
     print("Missing key:", key)
-    print("Target idx: ", target_idx, "(should match MOD_TO_IDX:", key[0], "->", target_idx.item(), ")")
+    print("Target idx: ", target_idx)
     print("Case id:    ", case_id)
     break

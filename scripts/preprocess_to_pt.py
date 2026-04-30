@@ -19,6 +19,7 @@ FILE_MAP = {
     "flair": "t2f",
 }
 
+
 def load_case(case_dir: str):
     mods = {}
     for mod_key, file_tag in FILE_MAP.items():
@@ -32,7 +33,19 @@ def load_case(case_dir: str):
             raise FileNotFoundError(f"Missing {mod_key} in {case_dir}")
         arr = nib.load(found).get_fdata().astype(np.float32)
         mods[mod_key] = normalize_zscore(arr)
-    return mods
+
+    # Look for the seg file. BraTS naming is "{case}-seg.nii.gz".
+    # Validation cases may not have seg — return None in that case.
+    seg = None
+    for f in os.listdir(case_dir):
+        fl = f.lower()
+        if fl.endswith(".nii.gz") and "seg" in fl:
+            seg_path = os.path.join(case_dir, f)
+            seg = nib.load(seg_path).get_fdata().astype(np.uint8)
+            break
+
+    return mods, seg
+
 
 def preprocess_split(input_root: str, output_root: str):
     os.makedirs(output_root, exist_ok=True)
@@ -41,24 +54,44 @@ def preprocess_split(input_root: str, output_root: str):
         if os.path.isdir(os.path.join(input_root, d))
     )
 
+    cases_with_seg = 0
+    cases_without_seg = 0
+
     for case_name in tqdm(case_names, desc=f"Processing {os.path.basename(output_root)}"):
         case_dir = os.path.join(input_root, case_name)
         out_path = os.path.join(output_root, f"{case_name}.pt")
 
         if os.path.exists(out_path):
+            # Already cached. Skip — but track whether existing cache has seg.
+            blob = torch.load(out_path, map_location="cpu", weights_only=False)
+            if "seg" in blob and blob["seg"] is not None:
+                cases_with_seg += 1
+            else:
+                cases_without_seg += 1
             continue
 
-        mods = load_case(case_dir)
-        torch.save(
-            {
-                "case_id": case_name,
-                "t1": torch.from_numpy(mods["t1"]),
-                "t1ce": torch.from_numpy(mods["t1ce"]),
-                "t2": torch.from_numpy(mods["t2"]),
-                "flair": torch.from_numpy(mods["flair"]),
-            },
-            out_path,
-        )
+        mods, seg = load_case(case_dir)
+
+        blob = {
+            "case_id": case_name,
+            "t1": torch.from_numpy(mods["t1"]),
+            "t1ce": torch.from_numpy(mods["t1ce"]),
+            "t2": torch.from_numpy(mods["t2"]),
+            "flair": torch.from_numpy(mods["flair"]),
+        }
+
+        if seg is not None:
+            blob["seg"] = torch.from_numpy(seg)
+            cases_with_seg += 1
+        else:
+            blob["seg"] = None
+            cases_without_seg += 1
+
+        torch.save(blob, out_path)
+
+    print(f"  cases with seg: {cases_with_seg}")
+    print(f"  cases without seg: {cases_without_seg}")
+
 
 def main():
     train_root = os.path.join(
@@ -74,12 +107,12 @@ def main():
     val_cache = os.path.join(PROJECT_ROOT, "cache", "val")
 
     print("PROJECT_ROOT:", PROJECT_ROOT)
-    print("SRC_ROOT exists:", os.path.exists(SRC_ROOT))
     print("TRAIN ROOT exists:", os.path.exists(train_root))
     print("VAL ROOT exists:", os.path.exists(val_root))
 
     preprocess_split(train_root, train_cache)
     preprocess_split(val_root, val_cache)
+
 
 if __name__ == "__main__":
     main()

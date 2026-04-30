@@ -90,10 +90,11 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
         t_schedule = torch.linspace(0, timesteps - 1, reverse_steps, dtype=torch.long).tolist()
         t_schedule = list(reversed(t_schedule))
 
-    # Each golden batch is now (cond, target, keys, target_idx, case_ids)
-    for cond, target, keys, target_idx, case_ids in golden_batches:
+    # Each golden batch is now (cond, target, tumor_mask, keys, target_idx, case_ids)
+    for cond, target, tumor_mask, keys, target_idx, case_ids in golden_batches:
         cond = cond.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        tumor_mask = tumor_mask.to(device, non_blocking=True)
         target_idx = target_idx.to(device, non_blocking=True)
 
         # -------------------------------------------------
@@ -110,10 +111,11 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
         snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
 
         pred_x0_1step = (x_t - torch.sqrt(1.0 - alpha_bar) * pred_noise) / (torch.sqrt(alpha_bar) + 1e-5)
-        pred_x0_1step = torch.clamp(pred_x0_1step, min=-3.0, max=3.0)
+        pred_x0_1step = torch.clamp(pred_x0_1step, min=-5.0, max=8.0)
 
         total_loss, loss_parts = loss_fn(
-            pred_noise, noise, pred_x0_1step, target, snr=snr, t=t, timesteps=timesteps
+            pred_noise, noise, pred_x0_1step, target,
+            snr=snr, t=t, timesteps=timesteps, tumor_mask=tumor_mask,
         )
 
         loss_accum.setdefault("val_total_loss", []).append(total_loss.item())
@@ -141,7 +143,7 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
                         a_bar_prev = torch.ones_like(a_bar_t)
 
                     p_x0 = (x_gen - torch.sqrt(1 - a_bar_t) * p_noise) / torch.sqrt(a_bar_t)
-                    p_x0 = torch.clamp(p_x0, min=-3.0, max=3.0)
+                    p_x0 = torch.clamp(p_x0, min=-5.0, max=8.0)
 
                     x_gen = torch.sqrt(a_bar_prev) * p_x0 + torch.sqrt(1 - a_bar_prev) * p_noise
 
@@ -150,8 +152,12 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
 
                 p_b = x_gen[b:b + 1]
                 t_b = target[b:b + 1]
+                tm_b = tumor_mask[b:b + 1]
 
-                metrics = metric_bundle(p_b, t_b)
+                # Brain mask: voxels where target is non-trivially above its min
+                brain_b = (t_b > t_b.min()).float()
+
+                metrics = metric_bundle(p_b, t_b, mask=brain_b, tumor_mask=tm_b)
 
                 for k, v in metrics.items():
                     metric_accum.setdefault(k, []).append(v)
@@ -200,6 +206,7 @@ def main():
         sampling_probs=cfg["missing_policy"].get("sampling_probs", None),
         backend=cfg["data"]["backend"],
         augmentation=cfg.get("augmentation", {}),
+        tumor_crop_prob=cfg.get("missing_policy", {}).get("tumor_crop_prob", 0.0),
     )
 
     val_aug_cfg = dict(cfg.get("augmentation", {}))
@@ -237,15 +244,22 @@ def main():
     print("Extracting Validation Micro-Batch...")
     golden_batches = []
 
-    # 5-tuple unpack now: cond, target, keys, target_idx, case_ids
-    for cond, target, keys, target_idx, case_ids in val_loader:
-        golden_batches.append((cond.clone(), target.clone(), keys, target_idx.clone(), case_ids))
+    # 6-tuple unpack: cond, target, tumor_mask, keys, target_idx, case_ids
+    for cond, target, tumor_mask, keys, target_idx, case_ids in val_loader:
+        golden_batches.append((
+            cond.clone(),
+            target.clone(),
+            tumor_mask.clone(),
+            keys,
+            target_idx.clone(),
+            case_ids,
+        ))
         if len(golden_batches) >= 4:
             break
 
     print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
 
-    for b_idx, (_, _, keys, _, case_ids) in enumerate(golden_batches):
+    for b_idx, (_, _, _, keys, _, case_ids) in enumerate(golden_batches):
         for i in range(len(keys)):
             mod = keys[i] if isinstance(keys, (list, tuple)) else keys
             c_id = case_ids[i] if isinstance(case_ids, (list, tuple)) else case_ids
@@ -300,7 +314,10 @@ def main():
         mae_weight=cfg["loss"]["mae_weight"],
         use_ssim=cfg["loss"]["use_ssim"],
         ssim_weight=cfg["loss"]["ssim_weight"],
-        min_snr_gamma=cfg["loss"].get("min_snr_gamma", 5.0),
+        use_raw_mae=cfg["loss"].get("use_raw_mae", True),
+        raw_mae_weight=cfg["loss"].get("raw_mae_weight", 0.5),
+        tumor_weight=cfg["loss"].get("tumor_weight", 3.0),
+        min_snr_gamma=cfg["loss"].get("min_snr_gamma", 0.5),
     )
 
     # Conditioning dropout — fraction of training steps where conditioning is
@@ -364,8 +381,8 @@ def main():
 
     try:
         while step < cfg["train"]["max_steps"]:
-            # 5-tuple unpack now
-            for cond, target, key, target_idx, current_case_id in train_loader:
+            # 6-tuple unpack: cond, target, tumor_mask, key, target_idx, case_id
+            for cond, target, tumor_mask, key, target_idx, current_case_id in train_loader:
                 if should_stop(run_dir, cfg):
                     print("\nStop file detected. Saving checkpoint...")
                     save_checkpoint(
@@ -381,15 +398,13 @@ def main():
 
                 cond = cond.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
+                tumor_mask = tumor_mask.to(device, non_blocking=True)
                 target_idx = target_idx.to(device, non_blocking=True)
 
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.q_sample(target, t)
 
-                # Conditioning dropout: with prob `cond_dropout_prob`, zero
-                # the cond channels (modalities + presence mask) AND swap the
-                # class label to the null token. Per-sample, not per-batch,
-                # so different samples in a batch may or may not be dropped.
+                # Conditioning dropout
                 if cond_dropout_prob > 0.0:
                     drop_mask = (
                         torch.rand(cond.shape[0], device=device) < cond_dropout_prob
@@ -416,7 +431,7 @@ def main():
                     x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
                 ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
-                pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
+                pred_x0 = torch.clamp(pred_x0, min=-5.0, max=8.0)
 
                 loss, loss_parts = loss_fn(
                     pred_noise.float(),
@@ -426,6 +441,7 @@ def main():
                     snr=snr,
                     t=t,
                     timesteps=cfg["diffusion"]["timesteps"],
+                    tumor_mask=tumor_mask,
                 )
 
                 if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(pred_x0).all():
@@ -481,8 +497,11 @@ def main():
                         f"step={step} "
                         f"loss={loss.item():.6f} "
                         f"noise_mse={loss_parts.get('noise_mse', 0):.6f} "
+                        f"raw_mae={loss_parts.get('raw_mae', 0):.6f} "
                         f"mae_loss={loss_parts.get('mae_loss', 0):.6f} "
                         f"ssim_loss={loss_parts.get('ssim_loss', 0):.6f} "
+                        f"aux_w={loss_parts.get('aux_w_mean', 0):.3f} "
+                        f"tumor_frac={loss_parts.get('tumor_frac', 0):.3f} "
                         f"missing={missing_str} "
                         f"lr={lr:.6e} "
                         f"time={step_time:.3f}s "
@@ -531,12 +550,27 @@ def main():
                             f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
                         print(
                             f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
+                        # Region-level breakouts when tumor masks are available
+                        tumor_ssim = val_stats.get("val_tumor_ssim")
+                        healthy_ssim = val_stats.get("val_healthy_ssim")
+                        if tumor_ssim is not None or healthy_ssim is not None:
+                            ts = f"{tumor_ssim:>7.4f}" if tumor_ssim is not None else "   n/a "
+                            hs = f"{healthy_ssim:>7.4f}" if healthy_ssim is not None else "   n/a "
+                            tp = f"{val_stats.get('val_tumor_psnr', float('nan')):>7.4f}"
+                            hp = f"{val_stats.get('val_healthy_psnr', float('nan')):>7.4f}"
+                            print(f"  Tumor   SSIM: {ts}   |  Tumor PSNR:   {tp}")
+                            print(f"  Healthy SSIM: {hs}   |  Healthy PSNR: {hp}")
                         print("-" * 65)
 
                         for mod in ["t1ce", "flair"]:
                             if f"val_{mod}_ssim" in val_stats:
                                 print(
                                     f"[{mod.upper():>5}] PSNR: {val_stats[f'val_{mod}_psnr']:>7.4f}  |  SSIM: {val_stats[f'val_{mod}_ssim']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_mae']:>7.4f}")
+                                # Per-modality tumor breakout if present
+                                if f"val_{mod}_tumor_ssim" in val_stats:
+                                    print(
+                                        f"        [tumor]  SSIM: {val_stats[f'val_{mod}_tumor_ssim']:>7.4f}  |  PSNR: {val_stats[f'val_{mod}_tumor_psnr']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_tumor_mae']:>7.4f}"
+                                    )
                         print(f"{'=' * 50}\n")
                     else:
                         print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}")

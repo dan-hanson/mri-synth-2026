@@ -225,7 +225,7 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
 
             pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
-            pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
+            pred_x0 = torch.clamp(pred_x0, min=-5.0, max=8.0)
 
             x = torch.sqrt(alpha_bar_prev) * pred_x0 + torch.sqrt(1 - alpha_bar_prev) * pred_noise
 
