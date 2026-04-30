@@ -15,7 +15,7 @@ from mri_missing.models.registry import build_model
 from mri_missing.diffusion.scheduler import DiffusionScheduler
 from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 from mri_missing.utils.io import load_checkpoint, save_json
-from mri_missing.utils.cases import MOD_KEYS, resolve_case_dirs
+from mri_missing.utils.cases import MOD_KEYS, MOD_TO_IDX, NUM_MODALITIES, resolve_case_dirs
 from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_zscore, normalize_per_case_01_np
 from mri_missing.utils.visualization import save_slice_panel
 from monai.inferers import sliding_window_inference
@@ -43,11 +43,11 @@ def prepare_condition(cfg, data_dict, missing_key):
             cond.append(data_dict[k].astype(np.float32))
             mask.append(np.ones_like(data_dict[k], dtype=np.float32))
 
-    cond = np.stack(cond, axis=0)  # [4, D, H, W]
+    cond = np.stack(cond, axis=0)
 
     if use_presence_mask:
-        mask = np.stack(mask, axis=0)  # [4, D, H, W]
-        cond = np.concatenate([cond, mask], axis=0)  # [8, D, H, W]
+        mask = np.stack(mask, axis=0)
+        cond = np.concatenate([cond, mask], axis=0)
 
     return cond, target
 
@@ -88,6 +88,9 @@ def build_infer_model(cfg, device):
         model_kwargs["transformer_num_layers"] = cfg["model"].get("transformer_num_layers", 1)
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
 
+        if cfg["model"].get("use_target_class_embed", False):
+            model_kwargs["num_class_embeds"] = NUM_MODALITIES
+
     model = build_model(model_name, **model_kwargs).to(device)
     return model
 
@@ -96,12 +99,10 @@ def build_infer_model(cfg, device):
 def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     data_dict, affine, header = load_case(case_dir)
 
-    # 1. Preserve the absolute native scanner intensities
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
     raw_target = raw_data_dict[missing_key]
     raw_min, raw_max = raw_target.min(), raw_target.max()
 
-    # 2. Apply Z-Score so the model gets the distribution it was trained on
     for k in data_dict:
         data_dict[k] = normalize_zscore(data_dict[k])
 
@@ -122,6 +123,41 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     cond = torch.tensor(cond_crop[None], dtype=torch.float32, device=device)
     x = torch.randn((1, 1, *target_crop.shape), device=device)
 
+    # Target-modality class label (shape [B=1])
+    target_idx = torch.tensor([MOD_TO_IDX[missing_key]], dtype=torch.long, device=device)
+
+    # CFG setup: pull guidance scale and null-label index from config / model.
+    # null_label_index is exposed by MonaiDiffusionWrapper when num_class_embeds is set.
+    # If the model was trained without conditioning dropout, set guidance_scale to 1.0
+    # in the config to fall back to plain conditional inference (no extra forward pass).
+    guidance_scale = cfg["inference"].get("cfg_guidance_scale", 1.0)
+    use_cfg = guidance_scale != 1.0
+
+    if use_cfg:
+        # Resolve the wrapped module (handles torch.compile / EMA shadow / DataParallel).
+        # The MonaiDiffusionWrapper instance is whatever .net or itself exposes null_label_index.
+        wrapped = model
+        # Walk through common wrappers to find null_label_index
+        for _ in range(4):
+            if hasattr(wrapped, "null_label_index") and wrapped.null_label_index is not None:
+                break
+            if hasattr(wrapped, "_orig_mod"):  # torch.compile
+                wrapped = wrapped._orig_mod
+            elif hasattr(wrapped, "module"):  # DataParallel / DDP
+                wrapped = wrapped.module
+            else:
+                break
+
+        if not hasattr(wrapped, "null_label_index") or wrapped.null_label_index is None:
+            raise ValueError(
+                "CFG inference requested (cfg_guidance_scale != 1.0) but the model has no "
+                "null_label_index. Was the model trained with use_target_class_embed=true? "
+                "If guidance is not desired, set inference.cfg_guidance_scale: 1.0 in the config."
+            )
+        null_idx = torch.tensor([wrapped.null_label_index], dtype=torch.long, device=device)
+        # Unconditional cond tensor: zeros across all 8 channels (4 modality + 4 presence).
+        cond_zero = torch.zeros_like(cond)
+
     reverse_steps = cfg["inference"]["reverse_steps"]
     total_train_steps = cfg["diffusion"]["timesteps"]
 
@@ -139,25 +175,46 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     start = time.time()
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+    def _forward_once(model_input, t_scalar, cls_scalar):
+        """One forward pass through model, sliding-window-aware. cls_scalar is shape [1]."""
+        if use_sw:
+            def predictor(patch_x):
+                bs = patch_x.shape[0]
+                return model(
+                    patch_x,
+                    t_scalar.expand(bs),
+                    class_labels=cls_scalar.expand(bs),
+                )
+
+            return sliding_window_inference(
+                inputs=model_input,
+                roi_size=roi_size,
+                sw_batch_size=sw_batch_size,
+                predictor=predictor,
+                overlap=overlap,
+                mode="gaussian",
+            )
+        else:
+            return model(model_input, t_scalar, class_labels=cls_scalar)
+
     with torch.autocast(device_type="cuda", dtype=amp_dtype):
         for i, t_idx in enumerate(t_schedule):
             t = torch.tensor([t_idx], device=device, dtype=torch.long)
-            model_in = torch.cat([cond, x], dim=1)
 
-            if use_sw:
-                def predictor(patch_x):
-                    return model(patch_x, t)
+            # Conditional pass: real conditioning + real class label
+            cond_in = torch.cat([cond, x], dim=1)
+            pred_cond = _forward_once(cond_in, t, target_idx)
 
-                pred_noise = sliding_window_inference(
-                    inputs=model_in,
-                    roi_size=roi_size,
-                    sw_batch_size=sw_batch_size,
-                    predictor=predictor,
-                    overlap=overlap,
-                    mode="gaussian"
-                )
+            if use_cfg:
+                # Unconditional pass: zeroed conditioning + null class label
+                uncond_in = torch.cat([cond_zero, x], dim=1)
+                pred_uncond = _forward_once(uncond_in, t, null_idx)
+
+                # CFG extrapolation. guidance_scale=1.0 collapses back to pred_cond.
+                # Typical values: 1.5 (mild), 3.0 (standard), 7.5 (strong).
+                pred_noise = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
             else:
-                pred_noise = model(model_in, t)
+                pred_noise = pred_cond
 
             alpha_bar_t = diffusion.alpha_cumprod[t_idx].view(1, 1, 1, 1, 1)
 
@@ -174,25 +231,16 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     elapsed = time.time() - start
 
-    # --- THE INTENSITY FIX ---
-    # 1. Grab the model's Z-scored prediction
     pred_cropped = x[0, 0].detach().cpu().numpy()
-
-    # 2. Map the Z-score exactly to a [0, 1] range safely
     pred_cropped_01 = normalize_per_case_01_np(pred_cropped)
-
-    # 3. Upscale the [0, 1] brain back to Native Scanner space (e.g., 0 to 2500)
     pred_native = (pred_cropped_01 * (raw_max - raw_min)) + raw_min
 
-    # Create empty background using the native target shape
     pred_full = np.zeros_like(raw_target)
     pred_full[d0:d1, h0:h1, w0:w1] = pred_native
 
-    # 4. Mask the native background (which is purely 0.0)
     brain_mask = raw_target > raw_target.min()
     pred_full = pred_full * brain_mask
 
-    # CRITICAL: Return `raw_target` instead of `target_np`!
     return pred_full, raw_target, cond_np, affine, header, elapsed, raw_data_dict
 
 
@@ -219,15 +267,12 @@ def main():
     infer_model = ema.shadow if (ema is not None and cfg["ema"]["infer_with_ema"]) else model
     infer_model.eval()
 
-    # --- COMPILER TRICK FOR BLACKWELL ---
     if cfg["inference"].get("use_compile", False):
         if os.name == "nt":
             print("Warning: torch.compile is not fully supported on Windows. Skipping compile.")
         else:
             print("Compiling model for Linux (max-autotune). The first volume will take a few extra minutes...")
-            # max-autotune optimizes the graph specifically for inference speed
             infer_model = torch.compile(infer_model, mode="max-autotune")
-    # ------------------------------------
 
     diffusion = DiffusionScheduler(
         timesteps=cfg["diffusion"]["timesteps"],
@@ -270,14 +315,12 @@ def main():
     )
     ensure_dir(base_out)
 
-    # --- FIX: SAFE JSON LOADING ---
     summary_path = os.path.join(base_out, "summary.json")
     if os.path.exists(summary_path):
         with open(summary_path, "r") as f:
             summary = json.load(f)
     else:
         summary = []
-    # ------------------------------
 
     for case_dir in case_dirs:
         case_id = os.path.basename(case_dir)
@@ -316,22 +359,20 @@ def main():
                 png_path = os.path.join(item_dir, f"{case_id}_panel_{missing_key}.png")
                 save_slice_panel(cond, target, pred, png_path, missing_key=missing_key, title=f"{case_id}")
 
-            # --- FIX: ADDED METADATA & APPEND ---
             summary.append({
                 "case_id": case_id,
                 "missing_key": missing_key,
                 "elapsed_sec": elapsed,
                 "checkpoint": ckpt_path,
                 "reverse_steps": cfg["inference"]["reverse_steps"],
+                "cfg_guidance_scale": cfg["inference"].get("cfg_guidance_scale", 1.0),
                 "overlap": cfg["inference"]["sliding_window"]["overlap"],
                 "roi_size": cfg["inference"]["sliding_window"]["roi_size"],
                 **infer_metrics,
             })
-            # ------------------------------------
 
             print(f"[infer] case={case_id} missing={missing_key} time={elapsed:.2f}s")
 
-            # Save incrementally inside the loop so you don't lose data if it crashes
             save_json(summary_path, summary)
 
     print(f"Saved inference outputs to: {base_out}")

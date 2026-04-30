@@ -1,21 +1,21 @@
 project:
   name: mri_missing_modality
   output_root: outputs
-  run_name: null   # if null, auto-generate
+  run_name: embed_v2   # if null, auto-generate
 
-mode: infer   # train | infer
+mode: train   # train | infer
 
 seed:
   value: 42
   deterministic: false
 
 data:
-  train_root: ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
-  val_root: ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  train_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+  val_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
 
   backend: pt_cache   # nifti | pt_cache
-  train_cache_root: ".../cache/train"
-  val_cache_root: ".../cache/val"
+  train_cache_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/cache/train"
+  val_cache_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/cache/val"
 
 loader:
   batch_size: 1
@@ -31,6 +31,7 @@ model:
   name: monai_diffusion_ssim
   in_channels: 9
   out_channels: 1
+  use_target_class_embed: true #enables target-modality embedding
 
   channels: [96, 192, 384, 512]
   attention_levels: [false, false, true, true]
@@ -70,29 +71,31 @@ augmentation:
   rotation_max_deg: 15
 
 train:
-  max_steps: 140000
+  max_steps: 50000
   accumulate_grad_batches: 4
   save_every: 1000
   log_every: 1000
   use_amp: true
-  use_compile: false   # Set to false on Windows, true on Linux
-  resume: ".../outputs/20260409_155232_monai_diffusion/checkpoints/latest.pt" # path to checkpoint or null
+  use_compile: true   # Set to false on Windows, true on Linux
+  resume: null # path to checkpoint or null
 
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260411_144131_monai_diffusion_ssim"
+  run_dir: "outputs/embed_v2"
   checkpoint_name: "best_ssim.pt"
-  data_root:  ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  data_root:  "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
   case_ids: ["BraTS-GLI-00001-000"]
   random_case_count: 0
   random_case_seed: 42
-  missing_keys: ["t1ce"] # e.g. ["t1", "t1ce", "t2", "flair"]
+  missing_keys: ["t1ce", "flair"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
   save_nifti: true
   save_composite_nifti: true
   save_png: true
   reverse_steps: 100
+  run_name: "v3_cfg20"          # change this between runs
+  cfg_guidance_scale: 2.0   # NEW — CFG inference. 1.0 disables, typical 1.5-7.5
 
   sliding_window:
     enabled: true
@@ -101,7 +104,7 @@ inference:
     overlap: 0.50
 
 validation:
-  light_every: 100000
+  light_every: 1000
   heavy_every: 3000
 
 runtime:
@@ -130,6 +133,8 @@ loss:
   mae_weight: 1.0       # Lowered from 0.25 to prevent overpowering the noise MSE
   use_ssim: true       # Turned off for training to massively boost iterations/second
   ssim_weight: 1.0
+  min_snr_gamma: 0.5          # NEW — Min-SNR-γ cap for aux loss weighting
+  cond_dropout_prob: 0.10     # NEW — fraction of steps where cond is dropped
 
 ema:
   enabled: true

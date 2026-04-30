@@ -3,6 +3,16 @@ from monai.networks.nets import DiffusionModelUNet
 
 
 class MonaiDiffusionWrapper(nn.Module):
+    """
+    Wraps MONAI's DiffusionModelUNet.
+
+    When num_class_embeds is set to N, this wrapper internally reserves one
+    extra slot (index N) as a "null" / dropped-label token used for
+    conditioning dropout during training. The model is built with
+    num_class_embeds = N + 1 in that case, transparent to callers — pass
+    class labels in [0, N) for real labels, or N for the null token.
+    """
+
     def __init__(
         self,
         in_channels=9,
@@ -16,8 +26,19 @@ class MonaiDiffusionWrapper(nn.Module):
         resblock_updown=False,
         transformer_num_layers=1,
         dropout_cattn=0.0,
+        num_class_embeds=None,   # 4 for {t1, t1ce, t2, flair}; null token is added internally
     ):
         super().__init__()
+        self.num_class_embeds = num_class_embeds
+
+        # Reserve one extra slot for the null/dropped label
+        if num_class_embeds is not None:
+            internal_num_class_embeds = num_class_embeds + 1
+            self.null_label_index = num_class_embeds  # last slot is null
+        else:
+            internal_num_class_embeds = None
+            self.null_label_index = None
+
         self.net = DiffusionModelUNet(
             spatial_dims=3,
             in_channels=in_channels,
@@ -32,7 +53,7 @@ class MonaiDiffusionWrapper(nn.Module):
             with_conditioning=False,
             transformer_num_layers=transformer_num_layers,
             cross_attention_dim=None,
-            num_class_embeds=None,
+            num_class_embeds=internal_num_class_embeds,
             upcast_attention=False,
             dropout_cattn=dropout_cattn,
             include_fc=True,
@@ -40,5 +61,10 @@ class MonaiDiffusionWrapper(nn.Module):
             use_flash_attention=True,
         )
 
-    def forward(self, x, t):
-        return self.net(x, timesteps=t)
+    def forward(self, x, t, class_labels=None):
+        if self.num_class_embeds is not None and class_labels is None:
+            raise ValueError(
+                "MonaiDiffusionWrapper was built with num_class_embeds, "
+                "but forward() was called without class_labels."
+            )
+        return self.net(x, timesteps=t, class_labels=class_labels)

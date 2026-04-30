@@ -24,8 +24,8 @@ from mri_missing.metrics.image_metrics import ImageMetricBundle
 from mri_missing.utils.visualization import save_history_plots
 from mri_missing.losses.image_losses import CompositeSynthesisLoss
 from mri_missing.utils.ema import EMA
+from mri_missing.utils.cases import NUM_MODALITIES
 
-# Enable TF32 on compatible NVIDIA GPUs for faster training (with a potential minor impact on precision)
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -59,7 +59,7 @@ def build_scheduler(cfg, optimizer):
         def lr_lambda(current_step):
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
-            return 1.0  # Stay flat after warmup
+            return 1.0
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif name == "none":
@@ -83,28 +83,28 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
     metric_accum = {}
     modality_metrics = {}
 
-    # detemine best available precision for generation and metrics
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    # Setup a fast 20-step DDIM schedule for proxy generation
     if compute_heavy:
         reverse_steps = 20
         t_schedule = torch.linspace(0, timesteps - 1, reverse_steps, dtype=torch.long).tolist()
         t_schedule = list(reversed(t_schedule))
 
-    for cond, target, keys, case_ids in golden_batches:
+    # Each golden batch is now (cond, target, keys, target_idx, case_ids)
+    for cond, target, keys, target_idx, case_ids in golden_batches:
         cond = cond.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        target_idx = target_idx.to(device, non_blocking=True)
 
         # -------------------------------------------------
-        # 1. LIGHT VAL: Loss tracking at random timesteps
+        # 1. LIGHT VAL
         # -------------------------------------------------
         t = scheduler.sample_timesteps(cond.shape[0], device)
         x_t, noise = scheduler.q_sample(target, t)
         x_in = torch.cat([cond, x_t], dim=1)
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and device == "cuda"):
-            pred_noise = model(x_in, t)
+            pred_noise = model(x_in, t, class_labels=target_idx)
 
         alpha_bar = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
         snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
@@ -121,10 +121,9 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
             loss_accum.setdefault(f"val_{k}", []).append(v)
 
         # -------------------------------------------------
-        # 2. HEAVY VAL: True Generation (Mini-DDIM)
+        # 2. HEAVY VAL
         # -------------------------------------------------
         if compute_heavy:
-            # Start from pure static noise
             x_gen = torch.randn_like(target)
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and device == "cuda"):
@@ -132,7 +131,7 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
                     t_tensor = torch.full((cond.shape[0],), t_idx, device=device, dtype=torch.long)
                     model_in = torch.cat([cond, x_gen], dim=1)
 
-                    p_noise = model(model_in, t_tensor)
+                    p_noise = model(model_in, t_tensor, class_labels=target_idx)
 
                     a_bar_t = scheduler.alpha_cumprod[t_idx].view(-1, 1, 1, 1, 1)
                     if i < len(t_schedule) - 1:
@@ -146,23 +145,18 @@ def validate(model, golden_batches, scheduler, loss_fn, metric_bundle, device, u
 
                     x_gen = torch.sqrt(a_bar_prev) * p_x0 + torch.sqrt(1 - a_bar_prev) * p_noise
 
-            # Calculate Clinical Past_Metrics_Configs on the FULLY GENERATED patch
             for b in range(target.shape[0]):
-                # Extract the exact string modality for this specific item in the batch
                 mod = keys[b] if isinstance(keys, (list, tuple)) else keys
 
-                # Slice the batch to isolate this specific brain
                 p_b = x_gen[b:b + 1]
                 t_b = target[b:b + 1]
 
                 metrics = metric_bundle(p_b, t_b)
 
-                # Sort metrics globally and into their specific modality bucket
                 for k, v in metrics.items():
                     metric_accum.setdefault(k, []).append(v)
                     modality_metrics.setdefault(mod, {}).setdefault(k, []).append(v)
 
-    # --- AVERAGE OUT ALL METRICS ---
     out = {k: sum(vals) / max(len(vals), 1) for k, vals in loss_accum.items()}
 
     if compute_heavy:
@@ -216,7 +210,6 @@ def main():
         patch_size=tuple(cfg["patch"]["size"]),
         fill_value=cfg["missing_policy"]["fill_value"],
         use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
-        # Force Validation to ONLY test the hard modalities
         sampling_probs={"t1": 0.0, "t1ce": 0.5, "t2": 0.0, "flair": 0.5},
         backend=cfg["data"]["backend"],
         augmentation=val_aug_cfg,
@@ -240,28 +233,25 @@ def main():
         persistent_workers=cfg["loader"].get("persistent_workers", False),
     )
 
-    # --- VAL MICRO-BATCH ---
     print("\n" + "=" * 60)
     print("Extracting Validation Micro-Batch...")
     golden_batches = []
 
-    # Notice the updated unpacking: added case_ids
-    for cond, target, keys, case_ids in val_loader:
-        golden_batches.append((cond.clone(), target.clone(), keys, case_ids))
+    # 5-tuple unpack now: cond, target, keys, target_idx, case_ids
+    for cond, target, keys, target_idx, case_ids in val_loader:
+        golden_batches.append((cond.clone(), target.clone(), keys, target_idx.clone(), case_ids))
         if len(golden_batches) >= 4:
             break
 
     print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
 
-    # Print the exact Case IDs and their assigned missing modality
-    for b_idx, (_, _, keys, case_ids) in enumerate(golden_batches):
+    for b_idx, (_, _, keys, _, case_ids) in enumerate(golden_batches):
         for i in range(len(keys)):
             mod = keys[i] if isinstance(keys, (list, tuple)) else keys
             c_id = case_ids[i] if isinstance(case_ids, (list, tuple)) else case_ids
             print(f"  -> {c_id} [Missing: {mod.upper()}]")
 
     print("=" * 60 + "\n")
-    # ------------------------------
 
     model_name = cfg["model"]["name"].lower()
     model_kwargs = {
@@ -286,11 +276,14 @@ def main():
         model_kwargs["transformer_num_layers"] = cfg["model"].get("transformer_num_layers", 1)
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
 
+        # NEW: target-modality conditioning, opt-in via config
+        if cfg["model"].get("use_target_class_embed", False):
+            model_kwargs["num_class_embeds"] = NUM_MODALITIES
+
     model = build_model(model_name, **model_kwargs).to(device)
 
-    # --- OS-Safe Compiler Switch ---
     if cfg["train"].get("use_compile", False):
-        if os.name == "nt":  # 'nt' means Windows
+        if os.name == "nt":
             print("Warning: torch.compile is not fully supported on Windows. Skipping compilation.")
         else:
             print("Compiling model for Linux (this will take a few minutes)...")
@@ -307,7 +300,15 @@ def main():
         mae_weight=cfg["loss"]["mae_weight"],
         use_ssim=cfg["loss"]["use_ssim"],
         ssim_weight=cfg["loss"]["ssim_weight"],
+        min_snr_gamma=cfg["loss"].get("min_snr_gamma", 5.0),
     )
+
+    # Conditioning dropout — fraction of training steps where conditioning is
+    # zeroed and class label is replaced with the null index. Forces the model
+    # to learn the value of conditioning explicitly. 0.0 disables.
+    cond_dropout_prob = cfg["loss"].get("cond_dropout_prob", 0.0)
+    use_class_embed = cfg["model"].get("use_target_class_embed", False)
+    null_label_index = NUM_MODALITIES if use_class_embed else None
     scaler = torch.amp.GradScaler("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda")
 
     diffusion = DiffusionScheduler(
@@ -318,8 +319,6 @@ def main():
         beta_end=cfg["diffusion"]["beta_end"],
     ).to(device)
 
-    # time_embed = SinusoidalTimeEmbedding(128).to(device) -> not needed for monai_diffusion_ssim
-
     metric_bundle = ImageMetricBundle(
         compute_mae=cfg["metrics"]["compute_mae"],
         compute_psnr=cfg["metrics"]["compute_psnr"],
@@ -329,7 +328,7 @@ def main():
 
     start_step = 0
     best_val = float("inf")
-    best_ssim = -float("inf")  # track best SSIM separately for clinical checkpoint
+    best_ssim = -float("inf")
 
     if cfg["train"]["resume"]:
         ckpt = load_checkpoint(
@@ -349,6 +348,7 @@ def main():
     print(f"Run: {run_name}")
     print(f"Model: {model_name}")
     print(f"Trainable params: {count_params(model):,}")
+    print(f"Target-modality embedding: {cfg['model'].get('use_target_class_embed', False)}")
 
     step_timer = StepTimer()
     run_timer = RunTimer()
@@ -357,18 +357,15 @@ def main():
     model.train()
     step = start_step
 
-    # Fetch config value (default to 1 if missing)
     accum_steps = cfg["train"].get("accumulate_grad_batches", 1)
-
-    # Initialize zero gradients before the loop starts
     optimizer.zero_grad(set_to_none=True)
 
-    # --- Background IO pool for non-blocking saves ---
     io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
     try:
         while step < cfg["train"]["max_steps"]:
-            for cond, target, key, current_case_id in train_loader:
+            # 5-tuple unpack now
+            for cond, target, key, target_idx, current_case_id in train_loader:
                 if should_stop(run_dir, cfg):
                     print("\nStop file detected. Saving checkpoint...")
                     save_checkpoint(
@@ -384,26 +381,41 @@ def main():
 
                 cond = cond.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
+                target_idx = target_idx.to(device, non_blocking=True)
 
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.q_sample(target, t)
-                # t_emb = time_embed(t.float()) -> not needed for monai_diffusion_ssim
+
+                # Conditioning dropout: with prob `cond_dropout_prob`, zero
+                # the cond channels (modalities + presence mask) AND swap the
+                # class label to the null token. Per-sample, not per-batch,
+                # so different samples in a batch may or may not be dropped.
+                if cond_dropout_prob > 0.0:
+                    drop_mask = (
+                        torch.rand(cond.shape[0], device=device) < cond_dropout_prob
+                    )
+                    if drop_mask.any():
+                        cond_view = cond.clone()
+                        cond_view[drop_mask] = 0.0
+                        cond = cond_view
+
+                        if null_label_index is not None:
+                            target_idx_view = target_idx.clone()
+                            target_idx_view[drop_mask] = null_label_index
+                            target_idx = target_idx_view
+
                 x = torch.cat([cond, x_t], dim=1)
 
                 with torch.amp.autocast("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda"):
-                    pred_noise = model(x, t)
+                    pred_noise = model(x, t, class_labels=target_idx)
 
-                # fragile x0 reconstruction in fp32
                 alpha_bar_f32 = diffusion.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
-
-                # Calculate exact Signal-to-Noise Ratio for this step
                 snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
 
                 pred_x0 = (
-                                  x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
-                          ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
+                    x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
+                ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
-                # Prevent extreme mathematical outliers from shattering the gradients
                 pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
 
                 loss, loss_parts = loss_fn(
@@ -416,9 +428,7 @@ def main():
                     timesteps=cfg["diffusion"]["timesteps"],
                 )
 
-                # --- SAFETY CHECKS BEFORE BACKWARD ---
-                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(
-                        pred_x0).all():
+                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(pred_x0).all():
                     print(f"NaN detected at step={step}. Saving debug checkpoint...")
                     save_checkpoint(
                         os.path.join(ckpt_dir, "nan_debug.pt"),
@@ -427,18 +437,14 @@ def main():
                     )
                     break
 
-                # --- BACKWARD PASS (Scale loss for accumulation) ---
                 loss_scaled = loss / accum_steps
                 scaler.scale(loss_scaled).backward()
 
-                # --- OPTIMIZER STEP (Only every N steps) ---
                 if (step + 1) % accum_steps == 0 or (step + 1) == cfg["train"]["max_steps"]:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
-
-                    # Zero gradients AFTER stepping
                     optimizer.zero_grad(set_to_none=True)
 
                     if ema is not None:
@@ -486,7 +492,6 @@ def main():
                 if do_light_val or do_heavy_val:
                     val_model = ema.shadow if (ema is not None and cfg["ema"]["validate_with_ema"]) else model
 
-                    # Pass the golden_batches to BOTH light and heavy validation
                     val_stats = validate(
                         val_model,
                         golden_batches,
@@ -513,7 +518,6 @@ def main():
 
                     record.update(val_stats)
 
-                    # --- CONSOLE UI ---
                     prefix = "Val Heavy" if do_heavy_val else "Val Light"
                     print(f"\n{'=' * 12} [ {prefix} ] {'=' * 12}")
 
@@ -539,8 +543,6 @@ def main():
                         print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}")
                         print(f"{'=' * 46}\n")
 
-                    # --- DUAL CHECKPOINTING ---
-                    # Save the Math Checkpoint (Noise) - Updates on Light AND Heavy
                     if val_stats["val_noise_mse"] < best_val:
                         best_val = val_stats["val_noise_mse"]
                         save_checkpoint(
@@ -549,7 +551,6 @@ def main():
                             step, best_val, cfg, ema=ema
                         )
 
-                    # Save the Clinical Checkpoint (Structure) - Updates ONLY on Heavy
                     if "val_ssim" in val_stats and val_stats["val_ssim"] > best_ssim:
                         best_ssim = val_stats["val_ssim"]
                         save_checkpoint(
@@ -561,22 +562,12 @@ def main():
 
                     model.train()
 
-                    # VRAM Flush -> require on windows to prevent memory fragmentation from causing OOMs during validation
-                    # should not be needed on Linux, and may hurt performance
-                    # ------------------------------#
-                    # if torch.cuda.is_available():
-                    #     torch.cuda.empty_cache()
-                    # ------------------------------#
-
-                # Persist history only when something meaningful happened
                 if record is not None:
                     history.append(record)
 
-                # JSON writes now follow log cadence and important events
                 if should_log or do_light_val or do_heavy_val or should_save:
                     io_executor.submit(save_json, os.path.join(log_dir, "history.json"), list(history))
 
-                # Plot updates only on validation/save cadence
                 if do_light_val or do_heavy_val or should_save:
                     io_executor.submit(save_history_plots, list(history), os.path.join(run_dir, "plots"))
 

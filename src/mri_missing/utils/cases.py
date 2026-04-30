@@ -2,6 +2,8 @@ import os
 import random
 
 MOD_KEYS = ["t1", "t1ce", "t2", "flair"]
+MOD_TO_IDX = {k: i for i, k in enumerate(MOD_KEYS)}  # {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
+NUM_MODALITIES = len(MOD_KEYS)
 
 FILE_MAP = {
     "t1": "t1n",

@@ -4,6 +4,8 @@ import nibabel as nib
 import torch
 from torch.utils.data import Dataset
 from mri_missing.utils.nifti import normalize_zscore
+from mri_missing.utils.cases import MOD_KEYS, MOD_TO_IDX
+
 
 class BraTSDataset(Dataset):
     def __init__(self, root_dir, patch_size=(96, 96, 64), fill_value=1.0, use_presence_mask=True, sampling_probs=None, backend="nifti", augmentation=None):
@@ -33,28 +35,23 @@ class BraTSDataset(Dataset):
             ]
 
         print(f"Loaded {len(self.cases)} cases")
-    
+
     def crop_to_nonzero(self, mods):
-        # Create a boolean mask of where any modality has tissue
         mask = (mods["t1"] != 0) | (mods["t1ce"] != 0) | (mods["t2"] != 0) | (mods["flair"] != 0)
-        
-        # If the case is completely empty (shouldn't happen, but safe)
+
         if not mask.any():
             return mods
-            
+
         indices = np.nonzero(mask)
-        
-        # Find the tight bounding box
         d_min, d_max = indices[0].min(), indices[0].max() + 1
         h_min, h_max = indices[1].min(), indices[1].max() + 1
         w_min, w_max = indices[2].min(), indices[2].max() + 1
-        
-        # Crop all modalities
+
         for k in mods:
             mods[k] = mods[k][d_min:d_max, h_min:h_max, w_min:w_max]
-            
+
         return mods
-    
+
     def random_crop(self, cond, target, size=(96, 96, 64)):
         _, D, H, W = cond.shape
         d, h, w = size
@@ -67,36 +64,31 @@ class BraTSDataset(Dataset):
         target = target[d0:d0+d, h0:h0+h, w0:w0+w]
 
         return cond, target
-    
+
     def apply_augmentations(self, cond, target):
         if not self.augmentation.get("enabled", False):
             return cond, target
 
-        # Safe flips only: sagittal / coronal style axes within patch space
         flip_prob = self.augmentation.get("flip_prob", 0.0)
         if np.random.rand() < flip_prob:
-            # flip depth axis
             cond = np.flip(cond, axis=1).copy()
             target = np.flip(target, axis=0).copy()
 
         if np.random.rand() < flip_prob:
-            # flip height axis
             cond = np.flip(cond, axis=2).copy()
             target = np.flip(target, axis=1).copy()
 
-        # Mild intensity shift
         if np.random.rand() < self.augmentation.get("intensity_shift_prob", 0.0):
             shift = np.random.uniform(
                 -self.augmentation.get("intensity_shift_max", 0.0),
                 self.augmentation.get("intensity_shift_max", 0.0),
             )
-            # only shift the first 4 channels (modalities), not the presence mask
             num_image_ch = 4
             cond[:num_image_ch] = cond[:num_image_ch] + shift
             target = target + shift
 
         return cond, target
-    
+
     def load_case_pt(self, case_path):
         blob = torch.load(case_path, map_location="cpu")
         return {
@@ -107,17 +99,11 @@ class BraTSDataset(Dataset):
         }
 
     def load_case(self, case_path):
-        modalities = {
-            "t1": None,
-            "t1ce": None,
-            "t2": None,
-            "flair": None
-        }
+        modalities = {"t1": None, "t1ce": None, "t2": None, "flair": None}
 
         for file in os.listdir(case_path):
             if "seg" in file.lower():
                 continue
-
             if not file.endswith(".nii.gz"):
                 continue
 
@@ -133,8 +119,6 @@ class BraTSDataset(Dataset):
             elif "t2f" in f:
                 modalities["flair"] = nib.load(full_path).get_fdata()
 
-        # print("Loading case:", case_path)
-        # print("Files:", os.listdir(case_path))
         for k, v in modalities.items():
             if v is None:
                 raise ValueError(f"Missing {k} in {case_path}")
@@ -142,7 +126,7 @@ class BraTSDataset(Dataset):
         return modalities
 
     def random_missing(self, mods):
-        keys = ["t1", "t1ce", "t2", "flair"]
+        keys = MOD_KEYS  # canonical order
 
         probs_cfg = getattr(self, "sampling_probs", None)
         if probs_cfg is None:
@@ -152,6 +136,7 @@ class BraTSDataset(Dataset):
             probs = probs / probs.sum()
 
         target_key = str(np.random.choice(keys, p=probs))
+        target_idx = MOD_TO_IDX[target_key]  # NEW
 
         target = mods[target_key]
 
@@ -169,13 +154,13 @@ class BraTSDataset(Dataset):
                 cond.append(mods[k].astype(np.float32))
                 mask.append(np.ones_like(mods[k], dtype=np.float32))
 
-        cond = np.stack(cond, axis=0) # [4, D, H, W]
-        mask = np.stack(mask, axis=0) # [4, D, H, W]
+        cond = np.stack(cond, axis=0)
+        mask = np.stack(mask, axis=0)
 
         if use_presence_mask:
-            cond = np.concatenate([cond, mask], axis=0) # [8, D, H, W]
+            cond = np.concatenate([cond, mask], axis=0)
 
-        return cond, target, target_key
+        return cond, target, target_key, target_idx
 
     def __len__(self):
         return len(self.cases)
@@ -187,20 +172,20 @@ class BraTSDataset(Dataset):
             mods = self.load_case_pt(case_path)
         else:
             mods = self.load_case(case_path)
-            
-            # 1. Strip the wasted background air first
             mods = self.crop_to_nonzero(mods)
 
         if self.backend != "pt_cache":
             for k in mods:
                 mods[k] = normalize_zscore(mods[k])
 
-        cond, target, target_key = self.random_missing(mods)
+        cond, target, target_key, target_idx = self.random_missing(mods)
         cond, target = self.random_crop(cond, target, size=self.patch_size)
         cond, target = self.apply_augmentations(cond, target)
 
         cond = torch.tensor(cond, dtype=torch.float32)
         target = torch.tensor(target, dtype=torch.float32).unsqueeze(0)
+        target_idx = torch.tensor(target_idx, dtype=torch.long)  # NEW
         case_id = os.path.basename(case_path).replace(".pt", "")
 
-        return cond, target, target_key, case_id
+        # Note: 5-tuple now. Update any consumer that unpacks this.
+        return cond, target, target_key, target_idx, case_id

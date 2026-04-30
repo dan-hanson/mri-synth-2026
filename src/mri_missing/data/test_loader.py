@@ -9,13 +9,15 @@ if SRC_ROOT not in sys.path:
 
 from mri_missing.data.dataset import BraTSDataset
 
-DATA_ROOT = ".../data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+DATA_ROOT = "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
 
 dataset = BraTSDataset(DATA_ROOT)
 loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-for cond, target, key in loader:
-    print("Condition:", cond.shape)
-    print("Target:", target.shape)
-    print("Missing:", key)
+for cond, target, key, target_idx, case_id in loader:
+    print("Condition:  ", cond.shape)
+    print("Target:     ", target.shape)
+    print("Missing key:", key)
+    print("Target idx: ", target_idx, "(should match MOD_TO_IDX:", key[0], "->", target_idx.item(), ")")
+    print("Case id:    ", case_id)
     break

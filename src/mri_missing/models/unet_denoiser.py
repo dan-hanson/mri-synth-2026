@@ -22,7 +22,7 @@ class ConvBlock(nn.Module):
 class TinyUNet3D(nn.Module):
     def __init__(self, in_channels=9, out_channels=1, base_ch=16):
         super().__init__()
-        
+
         self.time_embed = SinusoidalTimeEmbedding(128)
 
         self.time_mlp = nn.Sequential(
@@ -47,7 +47,8 @@ class TinyUNet3D(nn.Module):
 
         self.out = nn.Conv3d(base_ch, out_channels, kernel_size=1)
 
-    def forward(self, x, t):
+    def forward(self, x, t, class_labels=None):
+        # class_labels accepted for registry uniformity; not yet used here.
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
         b = self.bottleneck(self.pool2(e2))

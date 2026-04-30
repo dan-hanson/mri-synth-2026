@@ -40,7 +40,8 @@ class ConvNeXt3DDenoiser(nn.Module):
 
         self.head = nn.Conv3d(base_dim, out_channels, kernel_size=1)
 
-    def forward(self, x, t_emb):
+    def forward(self, x, t_emb, class_labels=None):
+        # class_labels accepted for registry uniformity; not yet used here.
         x = self.stem(x)
 
         t = self.time_mlp(t_emb).view(x.shape[0], -1, 1, 1, 1)
