@@ -120,8 +120,8 @@ def heavy_rank_score(val_stats, cfg):
 def make_light_val_batch(val_loader, device=None):
     '''Extract a single batch from the validation loader for quick, frequent validation during training.'''
     batch = next(iter(val_loader))
-    cond, target, keys, case_ids = batch
-    return [(cond.clone(), target.clone(), keys, case_ids)]
+    cond, target, keys, target_idx, case_ids = batch # Unpack 5 vars
+    return [(cond.clone(), target.clone(), keys, target_idx.clone(), case_ids)]
 
 
 def build_optimizer(cfg, model):
@@ -201,29 +201,33 @@ def validate(
         trained_betas_np = scheduler.betas.detach().cpu().numpy()
         ddim_scheduler = DDIMScheduler(
             trained_betas=trained_betas_np,
+            beta_schedule="scaled_linear", # <-- CRITICAL ADDITION
             clip_sample=True,
             clip_sample_range=1.0,
         )
 
     for batch in batches:
-        if len(batch) == 5:
-            cond, target, keys, case_ids, fixed_latent = batch
+        # Unpack the new structures
+        if len(batch) == 6:
+            cond, target, keys, target_idx, case_ids, fixed_latent = batch
         else:
-            cond, target, keys, case_ids = batch
+            cond, target, keys, target_idx, case_ids = batch
             fixed_latent = None
 
         cond = cond.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        target_idx = target_idx.to(device, non_blocking=True) # Send to GPU
 
         # -----------------------------
-        # light validation
+        # light validation forward pass
         # -----------------------------
         t = scheduler.sample_timesteps(cond.shape[0], device)
         x_t, noise = scheduler.q_sample(target, t)
         x_in = torch.cat([cond, x_t], dim=1)
 
         with amp_ctx:
-            pred_noise = model(x_in, t)
+            # Pass class_labels!
+            pred_noise = model(x_in, t, class_labels=target_idx)
 
         alpha_bar = scheduler.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
         snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
@@ -248,32 +252,30 @@ def validate(
             loss_accum.setdefault(f"val_{k}", []).append(float(v))
 
         # -----------------------------
-        # heavy validation
+        # heavy validation forward pass
         # -----------------------------
         if compute_heavy:
+            # RESTORED: Generate or load the starting noise
             if fixed_latent is not None:
                 x_gen = fixed_latent.to(device, non_blocking=True).clone()
             else:
                 x_gen = torch.randn_like(target)
 
-            # Recommend passing 25 here for speed, or syncing with cfg["inference"]["reverse_steps"]
+            # RESTORED: Set the step jumps for the scheduler
             ddim_scheduler.set_timesteps(reverse_steps)
 
             with amp_ctx:
                 for t_idx in ddim_scheduler.timesteps:
                     t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
                     t_tensor = torch.full(
-                        (cond.shape[0],),
-                        t_scalar,
-                        device=device,
-                        dtype=torch.long,
+                        (cond.shape[0],), t_scalar, device=device, dtype=torch.long
                     )
 
                     model_in = torch.cat([cond, x_gen], dim=1)
-                    p_noise = model(model_in, t_tensor)
+                    
+                    # Pass class_labels!
+                    p_noise = model(model_in, t_tensor, class_labels=target_idx) 
 
-                    # Clean 1st-order DDIM step. 
-                    # FIX: Removed the manual torch.clamp() that was destroying texture!
                     x_gen = ddim_scheduler.step(p_noise, t_idx, x_gen).prev_sample
 
             for b in range(target.shape[0]):
@@ -382,7 +384,7 @@ def main():
     golden_gen = torch.Generator(device="cpu")
     golden_gen.manual_seed(cfg["seed"]["value"] + 123456)
 
-    for cond, target, keys, case_ids in val_loader:
+    for cond, target, keys, target_idx, case_ids in val_loader: # Unpack 5 vars
         fixed_latent = torch.randn(
             target.shape,
             generator=golden_gen,
@@ -393,6 +395,7 @@ def main():
             cond.clone(),
             target.clone(),
             keys,
+            target_idx.clone(), # Append target_idx
             case_ids,
             fixed_latent.clone(),
         ))
@@ -401,7 +404,7 @@ def main():
             break
 
     print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
-    for _, _, keys, case_ids, _ in golden_batches:
+    for _, _, keys, _, case_ids, _ in golden_batches: 
         for i in range(len(keys)):
             mod = keys[i] if isinstance(keys, (list, tuple)) else keys
             c_id = case_ids[i] if isinstance(case_ids, (list, tuple)) else case_ids
@@ -431,6 +434,9 @@ def main():
         model_kwargs["resblock_updown"] = cfg["model"].get("resblock_updown", False)
         model_kwargs["transformer_num_layers"] = cfg["model"].get("transformer_num_layers", 1)
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
+        model_kwargs["use_flash_attention"] = cfg["model"].get("use_flash_attention", False)
+        if cfg["model"].get("use_target_class_embed", False):
+            model_kwargs["num_class_embeds"] = 4
 
     elif model_name == "swin":
         # Force img_size to perfectly match the patch size to avoid window mismatches
@@ -563,8 +569,15 @@ def main():
     # Main Training Loop
     #------------------
     try:
+        cond_dropout_prob = cfg["loss"].get("cond_dropout_prob", 0.0)
+        use_class_embed = cfg["model"].get("use_target_class_embed", False)
+        # 4 is the out-of-bounds index used as the "null" token for CFG
+        null_label_index = 4 if use_class_embed else None 
+
         while step < cfg["train"]["max_steps"]:
-            for cond, target, key, current_case_id in train_loader:
+            for cond, target, key, target_idx, current_case_id in train_loader:
+                
+                # RESTORED: Stop file logic
                 if should_stop(run_dir, cfg):
                     print("\nStop file detected. Saving checkpoint...")
                     save_checkpoint(
@@ -575,31 +588,43 @@ def main():
                     print("Saved stop checkpoint.")
                     return
 
+                # RESTORED: VRAM tracking and Timer start
                 reset_vram_stats()
                 step_timer.tic()
 
                 cond = cond.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
+                target_idx = target_idx.to(device, non_blocking=True)
 
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.q_sample(target, t)
-                # t_emb = time_embed(t.float()) -> not needed for monai_diffusion
+
+                # Classifier-Free Guidance (CFG) Dropout Logic
+                if cond_dropout_prob > 0.0:
+                    drop_mask = torch.rand(cond.shape[0], device=device) < cond_dropout_prob
+                    if drop_mask.any():
+                        cond_view = cond.clone()
+                        cond_view[drop_mask] = 0.0 # Zero out the context modalities
+                        cond = cond_view
+
+                        if null_label_index is not None:
+                            target_idx_view = target_idx.clone()
+                            target_idx_view[drop_mask] = null_label_index # Inject null token
+                            target_idx = target_idx_view
+
                 x = torch.cat([cond, x_t], dim=1)
 
                 with torch.amp.autocast("cuda", enabled=cfg["train"]["use_amp"] and device == "cuda"):
-                    pred_noise = model(x, t)
+                    # Pass the target class to the MONAI backbone
+                    pred_noise = model(x, t, class_labels=target_idx if use_class_embed else None)
 
-                # fragile x0 reconstruction in fp32
                 alpha_bar_f32 = diffusion.alpha_cumprod[t].view(-1, 1, 1, 1, 1).float()
-
-                # Calculate exact Signal-to-Noise Ratio for this step
                 snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
 
                 pred_x0 = (
                     x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
                 ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
-                # Prevent extreme mathematical outliers from shattering the gradients
                 pred_x0 = torch.clamp(pred_x0, min=-1.0, max=1.0)
 
                 loss, loss_parts = loss_fn(
@@ -643,6 +668,9 @@ def main():
                     if scheduler_lr is not None:
                         scheduler_lr.step()
 
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                
                 step_time = step_timer.toc()
                 vram_mb = get_vram_mb() if device == "cuda" else 0.0
                 lr = optimizer.param_groups[0]["lr"]

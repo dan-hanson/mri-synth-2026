@@ -213,8 +213,9 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     scheduler = DDIMScheduler(
         trained_betas=trained_betas_np,
-        clip_sample=True,          # Natively clamps x0 safely during the reverse process!
-        clip_sample_range=1.0,     # Locks it exactly to your [-1, 1] bounds
+        beta_schedule="scaled_linear", # CRITICAL FIX
+        clip_sample=True,          
+        clip_sample_range=1.0,     
     )
     scheduler.set_timesteps(cfg["inference"]["reverse_steps"])
 
@@ -226,28 +227,44 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     start = time.time()
     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
+    use_class_embed = cfg["model"].get("use_target_class_embed", False)
+    guidance_scale = cfg["inference"].get("cfg_guidance_scale", 1.0)
+    
+    # Map the missing modality string to our training integer
+    mod_to_idx = {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
+    target_idx = torch.tensor([mod_to_idx[missing_key]], device=device, dtype=torch.long)
+    null_idx = torch.tensor([4], device=device, dtype=torch.long) # 4 is the null token
+
     for t_idx in scheduler.timesteps:
         t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
         t = torch.tensor([t_scalar], device=device, dtype=torch.long)
 
-        model_in = torch.cat([cond, x], dim=1)
-
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            if use_sw:
-                def predictor(patch_in):
-                    return model(patch_in, t)
-                pred_noise = sliding_window_inference(
-                    inputs=model_in, 
-                    roi_size=roi_size, 
-                    sw_batch_size=sw_batch_size,
-                    predictor=predictor, 
-                    overlap=overlap, 
-                    mode="constant"
-                )
+            if guidance_scale > 1.0:
+                # --- Classifier-Free Guidance (Double Pass) ---
+                cond_zero = torch.zeros_like(cond) # Blind context for unconditional pass
+                
+                if use_sw:
+                    def pred_cond_fn(patch_in): return model(patch_in, t, class_labels=target_idx if use_class_embed else None)
+                    def pred_uncond_fn(patch_in): return model(patch_in, t, class_labels=null_idx if use_class_embed else None)
+                    
+                    noise_cond = sliding_window_inference(inputs=torch.cat([cond, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size, predictor=pred_cond_fn, overlap=overlap, mode="constant")
+                    noise_uncond = sliding_window_inference(inputs=torch.cat([cond_zero, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size, predictor=pred_uncond_fn, overlap=overlap, mode="constant")
+                else:
+                    noise_cond = model(torch.cat([cond, x], dim=1), t, class_labels=target_idx if use_class_embed else None)
+                    noise_uncond = model(torch.cat([cond_zero, x], dim=1), t, class_labels=null_idx if use_class_embed else None)
+                
+                # CFG Extrapolation Math
+                pred_noise = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
             else:
-                pred_noise = model(model_in, t)
+                # --- Standard Inference (No CFG) ---
+                if use_sw:
+                    def predictor(patch_in): return model(patch_in, t, class_labels=target_idx if use_class_embed else None)
+                    pred_noise = sliding_window_inference(inputs=torch.cat([cond, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size, predictor=predictor, overlap=overlap, mode="constant")
+                else:
+                    pred_noise = model(torch.cat([cond, x], dim=1), t, class_labels=target_idx if use_class_embed else None)
 
-        # DDIM math in float32 outside autocast to preserve numerical stability in the scheduler step
+        # DDIM math in float32 outside autocast to preserve numerical stability
         x = scheduler.step(pred_noise.float(), t_idx, x.float()).prev_sample
 
     elapsed = time.time() - start

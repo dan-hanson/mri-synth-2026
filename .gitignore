@@ -1,0 +1,93 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# PyTorch
+*.pth
+
+# Data and outputs
+data/
+outputs/
+checkpoints/
+
+# Logs
+*.log
+logs/
+
+# Environment
+env/
+venv/
+venv.bak/
+
+# VSCode
+.vscode/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Environments
+.venv/
+venv/
+env/
+.env/
+conda-meta/
+.micromamba/
+.mamba/
+.python-version
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+tmp/
+temp/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model outputs / experiments
+outputs/
+checkpoints/
+runs/
+logs/
+
+# Data
+data/
+datasets/
+*.nii
+*.nii.gz
+
+# Large artifacts / images from experiments
+*.pt
+*.pth
+*.ckpt
+
+# PyTorch / cache
+.cache/
+torch_compile_debug/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Misc
+*.bak
+*.orig

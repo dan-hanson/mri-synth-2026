@@ -115,7 +115,7 @@ def save_slice_panel(cond, target, pred, out_path, missing_key=None, title="samp
     pred_vis = pred.copy()
 
     # ---Dynamically scale all arrays for safe rendering ---
-    cond_vis = _norm_for_plot(cond)
+    cond_vis = _norm_for_plot(cond[:4])
     target_vis = _norm_for_plot(target)
     pred_vis = _norm_for_plot(pred)
 
@@ -173,7 +173,7 @@ def save_augmentation_panel(dataset, out_path, num_samples=5):
     case_id = None
     for i in range(num_samples):
         # By calling dataset[0] repeatedly, we force the random_crop and augmentations to roll again
-        cond, target, target_key, c_id = dataset[0] 
+        cond, target, target_key, _, c_id = dataset[0]
         if case_id is None:
             case_id = c_id
         

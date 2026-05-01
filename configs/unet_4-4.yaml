@@ -1,0 +1,88 @@
+project:
+  run_name: unet_ch_48_batch_2
+  output_root: outputs
+  run_name: null   # if null, auto-generate
+
+mode: train
+
+data:
+  train_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+  val_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+
+seed:
+  value: 42
+  deterministic: false
+
+loader:
+  batch_size: 2
+  num_workers: 2
+  pin_memory: true
+  shuffle: true
+
+patch:
+  size: [96, 96, 64]
+
+model:
+  name: unet
+  in_channels: 9
+  out_channels: 1
+  base_ch: 48
+  base_dim: 32
+
+diffusion:
+  timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+optim:
+  name: adamw
+  lr: 0.00005
+  weight_decay: 0.0001
+
+scheduler:
+  name: cosine
+  t_max: 5000
+  eta_min: 0.000001
+
+train:
+  max_steps: 5000
+  log_every: 50
+  save_every: 250
+  use_amp: true
+  resume: null
+
+validation:
+  light_every: 250
+  heavy_every: 500
+
+runtime:
+  device: cuda
+  cudnn_benchmark: true
+
+metrics:
+  compute_mae: true
+  compute_psnr: true
+  compute_ssim: true
+  eval_norm: per_case_minmax
+
+missing_policy:
+  fill_value: 1.0
+  use_presence_mask: true
+
+loss:
+  use_noise_mse: true
+  noise_mse_weight: 1.0
+  use_mae: true
+  mae_weight: 0.1
+  use_ssim: true
+  ssim_weight: 0.1
+
+ema:
+  enabled: true
+  decay: 0.999
+  validate_with_ema: true
+  infer_with_ema: true
+
+control:
+  stop_file: STOP
+

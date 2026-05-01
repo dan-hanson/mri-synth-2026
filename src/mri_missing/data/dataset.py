@@ -161,10 +161,9 @@ class BraTSDataset(Dataset):
         return modalities
 
     def random_missing(self, mods):
-        ''''Randomly selects one modality to be the target (missing),
-          constructs the condition tensor with the remaining modalities. 
-          Optionally includes a presence mask and fills the missing modality with a specified value.'''
         keys = ["t1", "t1ce", "t2", "flair"]
+        # Map string keys to integers for the class embedding
+        mod_to_idx = {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
 
         probs_cfg = getattr(self, "sampling_probs", None)
         if probs_cfg is None:
@@ -174,6 +173,7 @@ class BraTSDataset(Dataset):
             probs = probs / probs.sum()
 
         target_key = str(np.random.choice(keys, p=probs))
+        target_idx = mod_to_idx[target_key]
 
         target = mods[target_key]
 
@@ -191,16 +191,13 @@ class BraTSDataset(Dataset):
                 cond.append(mods[k].astype(np.float32))
                 mask.append(np.ones_like(mods[k], dtype=np.float32))
 
-        cond = np.stack(cond, axis=0) # [4, D, H, W]
-        mask = np.stack(mask, axis=0) # [4, D, H, W]
+        cond = np.stack(cond, axis=0) 
+        mask = np.stack(mask, axis=0) 
 
         if use_presence_mask:
-            cond = np.concatenate([cond, mask], axis=0) # [8, D, H, W]
+            cond = np.concatenate([cond, mask], axis=0) 
 
-        return cond, target, target_key
-
-    def __len__(self):
-        return len(self.cases)
+        return cond, target, target_key, target_idx
 
     def __getitem__(self, idx):
         case_path = self.cases[idx]
@@ -209,7 +206,6 @@ class BraTSDataset(Dataset):
             mods = self.load_case_pt(case_path)
         else:
             mods = self.load_case(case_path)
-            
             # 1. Strip the wasted background air first
             mods = self.crop_to_nonzero(mods)
 
@@ -217,12 +213,22 @@ class BraTSDataset(Dataset):
             for k in mods:
                 mods[k] = normalize_strict_bound(mods[k])
 
-        cond, target, target_key = self.random_missing(mods)
+        # --- FIX 1: Catch all 4 variables here ---
+        cond, target, target_key, target_idx = self.random_missing(mods)
+        
         cond, target = self.random_crop(cond, target, size=self.patch_size)
         cond, target = self.apply_augmentations(cond, target)
 
         cond = torch.tensor(cond, dtype=torch.float32)
         target = torch.tensor(target, dtype=torch.float32).unsqueeze(0)
+        
+        # --- FIX 2: Convert the target_idx to a tensor ---
+        target_idx = torch.tensor(target_idx, dtype=torch.long)
+        
         case_id = os.path.basename(case_path).replace(".pt", "")
 
-        return cond, target, target_key, case_id
+        # --- FIX 3: Return all 5 variables to train.py ---
+        return cond, target, target_key, target_idx, case_id
+
+    def __len__(self):
+        return len(self.cases)

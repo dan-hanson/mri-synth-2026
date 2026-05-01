@@ -28,6 +28,9 @@ class DiffusionScheduler:
             self.betas = torch.linspace(beta_start, beta_end, timesteps)
         elif schedule == "cosine":
             self.betas = cosine_beta_schedule(timesteps, s=cosine_s)
+        elif schedule == "scaled_linear_beta":
+            # The High-Res DDPM Standard
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, timesteps) ** 2
         else:
             raise ValueError(f"Unknown diffusion schedule: {schedule}")
 

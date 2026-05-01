@@ -56,30 +56,27 @@ class CompositeSynthesisLoss:
         if snr is None:
             return torch.ones(batch_size, device=device)
 
-        aux_weight = torch.clamp(snr, max=self.snr_cap).view(-1)
-
-        # "gate" = only emphasize low-noise steps without blowing up scale
-        if self.snr_weight_mode == "gate":
-            aux_weight = aux_weight / max(self.snr_cap, 1e-8)
-
-        # "amplify" preserves the older behavior, just capped
+        # Min-SNR-gamma implementation (Hang et al. 2023)
+        snr_flat = snr.view(-1)
+        aux_weight = torch.clamp(snr_flat, max=self.snr_cap) / (snr_flat + 1e-8)
+        
         return aux_weight
 
-    def _high_pass_texture_loss(self, pred, target):
-        pred_d = pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]
-        true_d = target[:, :, 1:, :, :] - target[:, :, :-1, :, :]
+    # def _high_pass_texture_loss(self, pred, target):
+    #     pred_d = pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]
+    #     true_d = target[:, :, 1:, :, :] - target[:, :, :-1, :, :]
 
-        pred_h = pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]
-        true_h = target[:, :, :, 1:, :] - target[:, :, :, :-1, :]
+    #     pred_h = pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]
+    #     true_h = target[:, :, :, 1:, :] - target[:, :, :, :-1, :]
 
-        pred_w = pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]
-        true_w = target[:, :, :, :, 1:] - target[:, :, :, :, :-1]
+    #     pred_w = pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]
+    #     true_w = target[:, :, :, :, 1:] - target[:, :, :, :, :-1]
 
-        loss_d = F.l1_loss(pred_d, true_d, reduction="none").mean(dim=(1, 2, 3, 4))
-        loss_h = F.l1_loss(pred_h, true_h, reduction="none").mean(dim=(1, 2, 3, 4))
-        loss_w = F.l1_loss(pred_w, true_w, reduction="none").mean(dim=(1, 2, 3, 4))
+    #     loss_d = F.l1_loss(pred_d, true_d, reduction="none").mean(dim=(1, 2, 3, 4))
+    #     loss_h = F.l1_loss(pred_h, true_h, reduction="none").mean(dim=(1, 2, 3, 4))
+    #     loss_w = F.l1_loss(pred_w, true_w, reduction="none").mean(dim=(1, 2, 3, 4))
 
-        return (loss_d + loss_h + loss_w) / 3.0
+    #     return (loss_d + loss_h + loss_w) / 3.0
 
     def __call__(
         self,

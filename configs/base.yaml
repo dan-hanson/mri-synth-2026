@@ -18,44 +18,44 @@ data:
   val_cache_root: C:/mri_synth_2026/cache/val
 
 loader:
-  batch_size: 2
+  batch_size: 1
   num_workers: 4 # can go higher on linux if needed
   shuffle: true
   pin_memory: true # can speed up dataloader
   persistent_workers: true # can speed up dataloader
 
 patch:
-  size: [128, 128, 64] #could increase this if you have room. I wouldn't worry about this as much for this run. 
+  size: [96, 96, 32] #could increase this if you have room. I wouldn't worry about this as much for this run. 
 
 model:
-  name: "swin_ddpm"
+  name: "monai_diffusion"
   in_channels: 9          
   out_channels: 1         
-  feature_size: 96        # I ran this at 72 - not compute optimal. if you need to lower this just adjust num_heads accordingly
-  window_size: [4, 4, 4]  # The 5.3x VRAM saver
-  depths: [2, 2, 2, 2]    # i ran this with [2, 2, 2, 2], but am curious about adding more at the third layer only. e.g. [2, 2, 4, 2] or even [2, 2, 6, 2] if VRAM allows. This sometimes helps with swin, but for mri I'm seeing [2, 2, 2, 2] a lot
-  num_heads: [3, 6, 12, 24] # you want feature size / num_heads = 32 (96/3 = 32, or 64/2 = 32) for optimal performance - if you change feature size just make sure to adjust num_heads accordingly to maintain this ratio
-  use_checkpoint: false    # mainly for for 16GB VRAM
-  spatial_dims: 3
-  drop_rate: 0.2 # could be tuned lower for better quality, but start with some regularization to stabilize training
-  attn_drop_rate: 0.0
-
+  channels: [96, 192, 384, 512]  
+  attention_levels: [False, False, False, True] # Attention ONLY at the deepest bottleneck
+  num_res_blocks: 2
+  num_head_channels: 64 # Required for the attention block mapping
+  norm_num_groups: 32
+  resblock_updown: true # Uses superior ResNet upsampling instead of basic interpolation
+  transformer_num_layers: 1
+  use_flash_attention: false
+  use_target_class_embed: true
+  
 diffusion:
   timesteps: 1000
-  schedule: cosine
-  beta_start: 0.0001
-  beta_end: 0.02
-  cosine_s: 0.008
+  schedule: "scaled_linear_beta" # MONAI's standard for high-res synthesis
+  beta_start: 0.0005
+  beta_end: 0.0195
 
 optim:
-  name: adamw
-  lr: 0.0001
+  name: adamw # AdamW is excellent, but we need a static LR
+  lr: 0.00005 # 5e-5 is the gold standard for continuous diffusion training
   weight_decay: 0.0001
 
 scheduler:
-  name: "cosine"
-  t_max: 50000 # if using gradient accumulation, this should be max_steps // accumulate_grad_batches
-  eta_min: 1.0e-6
+  name: "constant_with_warmup" 
+  warmup_steps: 2500 # Gently ramps up to 5e-5, then stays perfectly flat forever
+  # t_max and eta_min are ignored by this scheduler
 
 augmentation:
   enabled: true
@@ -71,18 +71,18 @@ train:
   log_every: 100 # also controls how often to plot metrics - consider implementing rolling average for smoother curves
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
-  resume: # path to checkpoint or null
+  resume:  # path to checkpoint or null
 
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260410_133833_swin_ddpm"
-  checkpoint_name: latest.pt
+  run_dir: "outputs/20260413_011658_swin_ddpm"
+  checkpoint_name: best_noise.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
   case_ids: [] # if empty, will run on all cases in data_root; otherwise specify list of case IDs to run
   random_case_count: 1
   random_case_seed: 42
-  missing_keys: ["t2"] # e.g. ["t1", "t1ce", "t2", "flair"]
+  missing_keys: ["t1ce"] # e.g. ["t1", "t1ce", "t2", "flair"]
   output_subdir: inference
   save_nifti: false
   save_composite_nifti: false # saves a nifti with all channels (cond + pred)
@@ -92,7 +92,7 @@ inference:
   sliding_window:
     enabled: true # not 100% yet, but I think we leave this off for swin
     roi_size: [128, 128, 64]
-    sw_batch_size: 2
+    sw_batch_size: 1
     overlap: 0.0
 
 validation: # determine how often we plot metrics during training
@@ -118,8 +118,8 @@ checkpoint:
 
   heavy_min_raw_ssim: 0.08
   heavy_min_raw_psnr: 10.0
-  heavy_max_raw_mae: 0.35
-  heavy_max_noise_mse: 0.35
+  heavy_max_raw_mae: 0.7
+  heavy_max_noise_mse: 0.5
 
   w_ssim: 0.45
   w_psnr: 0.20
@@ -154,10 +154,9 @@ loss:
   mae_weight: 1.0
   use_ssim: true
   ssim_weight: 1.0
-  use_texture_loss: true # experimental, may be noisy
-  texture_weight_max: 0.02 # I used this at 0.05 -> should probably test without and without it, but I think 0.02 may be good.
-  texture_fade_start: 0.4
-  texture_fade_end: 0.6
+  use_texture_loss: false
+  min_snr_gamma: 0.5          # Prevents gradient starvation at late timesteps
+  cond_dropout_prob: 0.10     # Classifier-Free Guidance probability
 
 
 ema:

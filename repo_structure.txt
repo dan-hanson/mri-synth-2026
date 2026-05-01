@@ -1,0 +1,62 @@
+mri-missing-modality/
+├─ README.md
+├─ .gitignore
+├─ environment.yml
+├─ requirements.txt
+├─ configs/
+│  ├─ base.yaml
+│  ├─ data_brats.yaml
+│  ├─ train_fast.yaml
+│  ├─ backbone_convnext3d.yaml
+│  ├─ backbone_swin.yaml
+│  └─ backbone_unet.yaml
+├─ scripts/
+│  ├─ setup_windows.ps1
+│  ├─ setup_linux.sh
+│  ├─ train.ps1
+│  ├─ train.sh
+│  ├─ infer.ps1
+│  └─ infer.sh
+├─ src/
+│  └─ mri_missing/
+│     ├─ __init__.py
+│     ├─ paths.py
+│     ├─ seed.py
+│     ├─ logging.py
+│     ├─ config.py
+│     ├─ data/
+│     │  ├─ dataset.py
+│     │  ├─ transforms.py
+│     │  ├─ split.py
+│     │  └─ missing_policy.py
+│     ├─ models/
+│     │  ├─ registry.py
+│     │  ├─ convnext3d_denoiser.py
+│     │  ├─ swin_denoiser.py
+│     │  ├─ unet_denoiser.py
+│     │  └─ blocks/
+│     ├─ diffusion/
+│     │  ├─ scheduler.py
+│     │  ├─ losses.py
+│     │  ├─ train_step.py
+│     │  └─ sampler.py
+│     ├─ engine/
+│     │  ├─ train.py
+│     │  ├─ validate.py
+│     │  ├─ infer.py
+│     │  └─ checkpoint.py
+│     └─ metrics/
+│        ├─ image_metrics.py
+│        └─ runtime_metrics.py
+├─ data/
+│  ├─ raw/
+│  ├─ processed/
+│  └─ splits/
+├─ outputs/
+│  ├─ checkpoints/
+│  ├─ logs/
+│  ├─ samples/
+│  └─ reports/
+└─ notebooks/
+   ├─ 00_data_audit.ipynb
+   └─ 01_quick_visual_checks.ipynb
