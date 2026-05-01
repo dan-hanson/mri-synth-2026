@@ -319,6 +319,8 @@ def main():
     print("Extracting Validation Micro-Batch...")
     golden_batches = []
 
+    n_golden = cfg["validation"].get("n_golden_batches", 4)
+
     # 6-tuple unpack: cond, target, tumor_mask, keys, target_idx, case_ids
     for cond, target, tumor_mask, keys, target_idx, case_ids in val_loader:
         golden_batches.append((
@@ -329,7 +331,7 @@ def main():
             target_idx.clone(),
             case_ids,
         ))
-        if len(golden_batches) >= 4:
+        if len(golden_batches) >= n_golden:
             break
 
     print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
@@ -433,6 +435,23 @@ def main():
         start_step = ckpt.get("step", 0) + 1
         best_val = ckpt.get("best_val", float("inf"))
         best_ssim = ckpt.get("best_ssim", -float("inf"))
+
+        # Optional LR override on resume.
+        # When set, overwrite every param group's LR after loading optimizer
+        # state. Useful for stepping LR down to break through a plateau without
+        # restarting from scratch. Set to null/None to keep the resumed LR.
+        override_lr = cfg["train"].get("override_lr_on_resume", None)
+        if override_lr is not None:
+            for pg in optimizer.param_groups:
+                pg["lr"] = float(override_lr)
+            print(f"[resume] Overriding optimizer LR to {override_lr} (was loaded from checkpoint)")
+
+            # If the LR scheduler is a LambdaLR, its base_lrs were captured at
+            # construction time. Overwrite them so the schedule keeps applying
+            # correctly on top of the new LR.
+            if scheduler_lr is not None and hasattr(scheduler_lr, "base_lrs"):
+                scheduler_lr.base_lrs = [float(override_lr)] * len(scheduler_lr.base_lrs)
+                print(f"[resume] Updated scheduler base_lrs to match.")
 
     print(f"Device: {device}")
     print(f"Run: {run_name}")

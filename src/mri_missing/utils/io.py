@@ -20,18 +20,50 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, step, best_val=No
     )
 
 
+def _adapt_state_dict(saved_state, target_state):
+    """
+    Reconcile a saved state_dict with the target model's expected key prefixes.
+
+    Handles three cases:
+      1. Saved keys match target keys exactly — return saved unchanged.
+      2. Saved has '_orig_mod.' prefix but target does not — strip it.
+      3. Target has '_orig_mod.' prefix but saved does not — add it.
+
+    Case 3 is what happens when a checkpoint was saved from an uncompiled
+    or transparently-unwrapped model and we're now loading into a
+    torch.compile()-wrapped model.
+    """
+    saved_keys = set(saved_state.keys())
+    target_keys = set(target_state.keys())
+
+    # Already matches — nothing to do
+    if saved_keys == target_keys or len(saved_keys & target_keys) > 0:
+        # If at least some keys overlap, no rewriting needed; PyTorch will
+        # surface any other mismatches itself.
+        if saved_keys.issubset(target_keys) or target_keys.issubset(saved_keys):
+            return saved_state
+
+    saved_has_prefix = any(k.startswith("_orig_mod.") for k in saved_keys)
+    target_has_prefix = any(k.startswith("_orig_mod.") for k in target_keys)
+
+    # Case 2: saved has prefix, target does not — strip
+    if saved_has_prefix and not target_has_prefix:
+        return {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v
+                for k, v in saved_state.items()}
+
+    # Case 3: target has prefix, saved does not — add
+    if target_has_prefix and not saved_has_prefix:
+        return {f"_orig_mod.{k}": v for k, v in saved_state.items()}
+
+    # Both have prefix or neither — leave as-is and let PyTorch report mismatches
+    return saved_state
+
+
 def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ema=None, map_location="cpu"):
     ckpt = torch.load(path, map_location=map_location)
 
-    model_state = ckpt["model_state"]
-
-    # Handle checkpoints saved from torch.compile models
-    if any(k.startswith("_orig_mod.") for k in model_state.keys()):
-        model_state = {
-            k.replace("_orig_mod.", "", 1): v
-            for k, v in model_state.items()
-        }
-
+    # Adapt model state for the target model's prefix convention
+    model_state = _adapt_state_dict(ckpt["model_state"], model.state_dict())
     model.load_state_dict(model_state)
 
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
@@ -44,14 +76,8 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, em
         scaler.load_state_dict(ckpt["scaler_state"])
 
     if ema is not None and ckpt.get("ema_state") is not None:
-        ema_state = ckpt["ema_state"]
-
-        if any(k.startswith("_orig_mod.") for k in ema_state.keys()):
-            ema_state = {
-                k.replace("_orig_mod.", "", 1): v
-                for k, v in ema_state.items()
-            }
-
+        # Adapt EMA state for the EMA model's prefix convention
+        ema_state = _adapt_state_dict(ckpt["ema_state"], ema.shadow.state_dict())
         ema.load_state_dict(ema_state)
 
     return ckpt

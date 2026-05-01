@@ -1,7 +1,7 @@
 project:
   name: mri_missing_modality
   output_root: outputs
-  run_name: embed_v6   # if null, auto-generate
+  run_name: embed_v6_patch128   # if null, auto-generate
 
 mode: train   # train | infer
 
@@ -10,12 +10,12 @@ seed:
   deterministic: false
 
 data:
-  train_root: "/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
-  val_root: "/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  train_root: "mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+  val_root: "mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
 
   backend: pt_cache   # nifti | pt_cache
-  train_cache_root: "/mri-synth-2026/cache/train"
-  val_cache_root: "/mri-synth-2026/cache/val"
+  train_cache_root: "mri-synth-2026/cache/train"
+  val_cache_root: "mri-synth-2026/cache/val"
 
   use_internal_val: true            # NEW — hold out training cases for val
   internal_val_seed: 42             # NEW — deterministic split seed
@@ -29,7 +29,7 @@ loader:
   persistent_workers: true
 
 patch:
-  size: [96, 96, 64]
+  size: [128, 128, 96]
 
 model:
   name: monai_diffusion_ssim
@@ -82,14 +82,15 @@ train:
   use_amp: true
   use_compile: true   # Set to false on Windows, true on Linux
   resume: null # path to checkpoint or null
+  override_lr_on_resume: null
 
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/embed_v4"
+  run_dir: "outputs/embed_v6_patch128"
   checkpoint_name: "best_ssim.pt"
-  data_root:  "/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
-  case_ids: ["BraTS-GLI-00001-000"]
+  data_root:  "mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+  case_ids: ["BraTS-GLI-00017-000"]
   random_case_count: 0
   random_case_seed: 42
   missing_keys: ["t1ce", "flair"] # e.g. ["t1", "t1ce", "t2", "flair"]
@@ -98,18 +99,19 @@ inference:
   save_composite_nifti: true
   save_png: true
   reverse_steps: 100
-  run_name: "v6_cfg20"          # change this between runs
+  run_name: "v6_128"          # change this between runs
   cfg_guidance_scale: 2.0   # NEW — CFG inference. 1.0 disables, typical 1.5-7.5
 
   sliding_window:
     enabled: true
-    roi_size: [96, 96, 64]
+    roi_size: [128, 128, 96]
     sw_batch_size: 2
     overlap: 0.50
 
 validation:
   light_every: 1000
   heavy_every: 3000
+  n_golden_batches: 16
 
 runtime:
   device: cuda
