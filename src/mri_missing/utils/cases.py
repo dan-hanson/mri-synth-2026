@@ -1,5 +1,6 @@
 import os
 import random
+import hashlib
 
 MOD_KEYS = ["t1", "t1ce", "t2", "flair"]
 MOD_TO_IDX = {k: i for i, k in enumerate(MOD_KEYS)}  # {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
@@ -11,6 +12,37 @@ FILE_MAP = {
     "t2": "t2w",
     "flair": "t2f",
 }
+
+
+def case_split_label(case_id: str, seed: int = 42, val_fraction: float = 0.12):
+    """
+    Deterministic split: returns "internal_val" or "internal_train" for a case ID.
+
+    Uses a stable hash so the same case_id always lands in the same split,
+    regardless of file order, machine, or run. Hash is salted with `seed` so
+    you can change splits later by changing the seed.
+
+    With ~1251 cases and val_fraction=0.12 you get about 150 internal-val cases.
+    """
+    h = hashlib.md5(f"{seed}:{case_id}".encode()).hexdigest()
+    # Map first 8 hex chars to a [0, 1) float
+    bucket = int(h[:8], 16) / 0xFFFFFFFF
+    return "internal_val" if bucket < val_fraction else "internal_train"
+
+
+def split_train_cases(case_ids, seed: int = 42, val_fraction: float = 0.12):
+    """
+    Given a list of training case IDs, return (train_ids, val_ids) sets.
+    Deterministic for a given seed.
+    """
+    train_ids = set()
+    val_ids = set()
+    for cid in case_ids:
+        if case_split_label(cid, seed=seed, val_fraction=val_fraction) == "internal_val":
+            val_ids.add(cid)
+        else:
+            train_ids.add(cid)
+    return train_ids, val_ids
 
 
 def list_case_dirs(root_dir):

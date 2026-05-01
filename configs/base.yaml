@@ -1,7 +1,7 @@
 project:
   name: mri_missing_modality
   output_root: outputs
-  run_name: embed_v5   # if null, auto-generate
+  run_name: embed_v6   # if null, auto-generate
 
 mode: train   # train | infer
 
@@ -10,12 +10,16 @@ seed:
   deterministic: false
 
 data:
-  train_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
-  val_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  train_root: "/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+  val_root: "/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
 
   backend: pt_cache   # nifti | pt_cache
-  train_cache_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/cache/train"
-  val_cache_root: "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/cache/val"
+  train_cache_root: "/mri-synth-2026/cache/train"
+  val_cache_root: "/mri-synth-2026/cache/val"
+
+  use_internal_val: true            # NEW — hold out training cases for val
+  internal_val_seed: 42             # NEW — deterministic split seed
+  internal_val_fraction: 0.12       # NEW — ~150 of 1251 cases
 
 loader:
   batch_size: 1
@@ -84,7 +88,7 @@ inference:
   use_compile: false
   run_dir: "outputs/embed_v4"
   checkpoint_name: "best_ssim.pt"
-  data_root:  "/home/heron/Desktop/PROJECTS/SP-Group/mri-synth-2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  data_root:  "/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
   case_ids: ["BraTS-GLI-00001-000"]
   random_case_count: 0
   random_case_seed: 42
@@ -94,7 +98,7 @@ inference:
   save_composite_nifti: true
   save_png: true
   reverse_steps: 100
-  run_name: "v5_cfg20"          # change this between runs
+  run_name: "v6_cfg20"          # change this between runs
   cfg_guidance_scale: 2.0   # NEW — CFG inference. 1.0 disables, typical 1.5-7.5
 
   sliding_window:
@@ -120,7 +124,7 @@ metrics:
 missing_policy:
   fill_value: 1.0
   use_presence_mask: true
-  tumor_crop_prob: 0.5         # NEW — 50% of training crops will contain tumor
+  tumor_crop_prob: 0.0         # off for v6
   sampling_probs:
     t1: 0.25
     t1ce: 0.25
@@ -131,14 +135,12 @@ loss:
   use_noise_mse: true
   noise_mse_weight: 1.0
   use_mae: true
-  mae_weight: 1.0       # Lowered from 0.25 to prevent overpowering the noise MSE
-  use_ssim: true       # Turned off for training to massively boost iterations/second
-  ssim_weight: 1.0
-  use_raw_mae: true              # NEW
-  raw_mae_weight: 0.5            # NEW — unclamped intensity supervision
-  tumor_weight: 3.0              # NEW — multiplier inside tumor regions
-  min_snr_gamma: 0.5          # NEW — Min-SNR-γ cap for aux loss weighting
-  cond_dropout_prob: 0.10     # NEW — fraction of steps where cond is dropped
+  mae_weight: 1.0
+  use_ssim: true
+  healthy_ssim_weight: 1.0      # NEW — replaces ssim_weight
+  tumor_ssim_weight: 1.0        # NEW — the BraSyn-style addition
+  min_snr_gamma: 0.5
+  cond_dropout_prob: 0.10
 
 ema:
   enabled: true

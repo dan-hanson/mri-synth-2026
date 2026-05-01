@@ -53,7 +53,7 @@ def save_history_plots(history, out_dir):
     )
 
     # --- 2. Validation loss components ------------------------------------
-    # Stack the four loss components on a single plot.
+    # Stack the loss components on a single plot.
     _save_plot(
         os.path.join(out_dir, "val_loss_components.png"),
         title="Validation Loss Components",
@@ -62,7 +62,8 @@ def save_history_plots(history, out_dir):
             "val_total_loss": _series(history, "val_total_loss"),
             "val_noise_mse": _series(history, "val_noise_mse"),
             "val_mae_loss": _series(history, "val_mae_loss"),
-            "val_ssim_loss": _series(history, "val_ssim_loss"),
+            "val_healthy_ssim_loss": _series(history, "val_healthy_ssim_loss"),
+            "val_tumor_ssim_loss": _series(history, "val_tumor_ssim_loss"),
         },
     )
 

@@ -18,6 +18,7 @@ class BraTSDataset(Dataset):
         backend="nifti",
         augmentation=None,
         tumor_crop_prob=0.0,
+        include_ids=None,
     ):
         self.root_dir = root_dir
         self.patch_size = patch_size
@@ -33,19 +34,28 @@ class BraTSDataset(Dataset):
         print("Entries:", os.listdir(root_dir)[:5] if os.path.exists(root_dir) else "INVALID")
 
         if self.backend == "pt_cache":
-            self.cases = [
+            all_cases = [
                 os.path.join(root_dir, f)
                 for f in os.listdir(root_dir)
                 if f.endswith(".pt")
             ]
         else:
-            self.cases = [
+            all_cases = [
                 os.path.join(root_dir, d)
                 for d in os.listdir(root_dir)
                 if os.path.isdir(os.path.join(root_dir, d))
             ]
 
-        print(f"Loaded {len(self.cases)} cases")
+        if include_ids is not None:
+            include_set = set(include_ids)
+            self.cases = [
+                p for p in all_cases
+                if os.path.basename(p).replace(".pt", "") in include_set
+            ]
+            print(f"Filtered to {len(self.cases)} of {len(all_cases)} cases via include_ids")
+        else:
+            self.cases = all_cases
+            print(f"Loaded {len(self.cases)} cases")
 
     def crop_to_nonzero(self, mods, seg=None):
         mask = (mods["t1"] != 0) | (mods["t1ce"] != 0) | (mods["t2"] != 0) | (mods["flair"] != 0)

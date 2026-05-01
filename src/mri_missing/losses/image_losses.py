@@ -7,26 +7,50 @@ except ImportError:
     SSIMLoss = None
 
 
+# MONAI's default SSIM window is 11x11x11. A tumor-region crop smaller than
+# that in any axis can't be SSIM'd; we fall back to the healthy term only.
+SSIM_MIN_DIM = 11
+
+
+def _tumor_bbox_or_none(tumor_mask, min_dim=SSIM_MIN_DIM):
+    """
+    Return (d0, d1, h0, h1, w0, w1) for the tight bounding box of the tumor,
+    or None if no tumor or the box is too small for the SSIM window.
+
+    Operates on the first sample only (batch size 1 is the common case).
+    """
+    if tumor_mask is None:
+        return None
+    bool_mask = tumor_mask[0, 0] > 0  # [D, H, W]
+    if not bool_mask.any():
+        return None
+
+    coords = torch.where(bool_mask)
+    d0, d1 = coords[0].min().item(), coords[0].max().item() + 1
+    h0, h1 = coords[1].min().item(), coords[1].max().item() + 1
+    w0, w1 = coords[2].min().item(), coords[2].max().item() + 1
+
+    if (d1 - d0) < min_dim or (h1 - h0) < min_dim or (w1 - w0) < min_dim:
+        return None
+
+    return d0, d1, h0, h1, w0, w1
+
+
 class CompositeSynthesisLoss:
     """
     Composite loss for noise-prediction diffusion training.
 
     Components:
-      - noise MSE      (full weight, applied uniformly across t)
-      - raw MAE        (z-score space, NO clamping — preserves intensity scale)
-      - clamped MAE    (mapped to [0,1] for stability, Min-SNR weighted)
-      - SSIM           (mapped to [0,1], Min-SNR weighted)
-
-    Tumor-region weighting:
-      Where a tumor mask is provided, MAE losses inside the tumor get
-      multiplied by `tumor_weight` (default 3.0). This pushes the model
-      to invest gradient signal in lesion appearance instead of producing
-      generic healthy-brain output.
+      - noise MSE       (full weight, applied uniformly across t)
+      - MAE on pred_x0  (Min-SNR weighted, healthy = whole brain)
+      - SSIM split into:
+          * healthy SSIM: whole-volume SSIM (BraSyn paper's healthy proxy)
+          * tumor SSIM:   SSIM on tumor bounding-box crop
+        Each with its own weight. When the patch has no tumor (or tumor is
+        too small for the SSIM window), the tumor term is skipped.
 
     Min-SNR-gamma weighting (Hang et al. 2023):
-      w(t) = min(SNR(t), gamma) / SNR(t)
-      Used on the clamped image-space losses (MAE, SSIM) to balance learning
-      across timesteps.
+        w(t) = min(SNR(t), gamma) / SNR(t)
     """
 
     def __init__(
@@ -36,10 +60,8 @@ class CompositeSynthesisLoss:
         use_mae=True,
         mae_weight=1.0,
         use_ssim=True,
-        ssim_weight=1.0,
-        use_raw_mae=True,
-        raw_mae_weight=0.5,
-        tumor_weight=3.0,
+        healthy_ssim_weight=1.0,
+        tumor_ssim_weight=1.0,
         min_snr_gamma=0.5,
         **kwargs,
     ):
@@ -48,10 +70,8 @@ class CompositeSynthesisLoss:
         self.use_mae = use_mae
         self.mae_weight = mae_weight
         self.use_ssim = use_ssim and SSIMLoss is not None
-        self.ssim_weight = ssim_weight
-        self.use_raw_mae = use_raw_mae
-        self.raw_mae_weight = raw_mae_weight
-        self.tumor_weight = tumor_weight
+        self.healthy_ssim_weight = healthy_ssim_weight
+        self.tumor_ssim_weight = tumor_ssim_weight
         self.min_snr_gamma = min_snr_gamma
 
         self.ssim_loss = (
@@ -73,60 +93,54 @@ class CompositeSynthesisLoss:
         total = 0.0
         parts = {}
 
-        # 1. Noise MSE — full weight, uniform across t
+        # 1. Noise MSE
         if self.use_noise_mse:
             mse = F.mse_loss(pred_noise, true_noise)
             total = total + self.noise_mse_weight * mse
             parts["noise_mse"] = mse.item()
 
-        # 2. Raw MAE in z-score space — NO clamping. This lets the model
-        # learn intensity scale including extreme values like edema (z >> 3)
-        # and CSF (z << -1). Tumor-weighted if mask given.
-        if self.use_raw_mae:
-            raw_mae_per_voxel = F.l1_loss(pred_x0, target_x0, reduction="none")
-
-            if tumor_mask is not None and self.tumor_weight != 1.0:
-                # weight mask: 1.0 outside tumor, tumor_weight inside
-                w_mask = 1.0 + (self.tumor_weight - 1.0) * tumor_mask
-                raw_mae_per_voxel = raw_mae_per_voxel * w_mask
-
-            raw_mae = raw_mae_per_voxel.mean()
-            total = total + self.raw_mae_weight * raw_mae
-            parts["raw_mae"] = raw_mae.item()
-
-        # 3. Map z-scored data to [0, 1] for clamped image-space metrics
+        # 2. Map z-scored data to [0, 1] for image-space metrics
         pred_eval = torch.clamp((pred_x0 + 3.0) / 6.0, min=0.0, max=1.0)
         target_eval = torch.clamp((target_x0 + 3.0) / 6.0, min=0.0, max=1.0)
 
-        # 4. Min-SNR-gamma weighting
+        # 3. Min-SNR weighting
         if snr is not None:
             snr_flat = snr.view(-1)
             aux_weight = torch.clamp(snr_flat, max=self.min_snr_gamma) / (snr_flat + 1e-8)
         else:
             aux_weight = torch.ones(pred_x0.shape[0], device=pred_x0.device)
 
-        # 5. Clamped MAE with optional tumor weighting
+        # 4. MAE (whole volume, Min-SNR weighted)
         if self.use_mae:
             mae_per_voxel = F.l1_loss(pred_eval, target_eval, reduction="none")
-
-            if tumor_mask is not None and self.tumor_weight != 1.0:
-                w_mask = 1.0 + (self.tumor_weight - 1.0) * tumor_mask
-                mae_per_voxel = mae_per_voxel * w_mask
-
             mae_per_batch = mae_per_voxel.mean(dim=(1, 2, 3, 4))
             mae_weighted = (mae_per_batch * aux_weight).mean()
-
             total = total + self.mae_weight * mae_weighted
             parts["mae_loss"] = mae_weighted.item()
 
-        # 6. SSIM. SSIM is structural — tumor weighting is awkward because
-        # SSIM operates on a window, not voxels. Leave unmodified.
+        # 5. Region-split SSIM
         if self.use_ssim:
-            ssim_per_batch = self.ssim_loss(pred_eval, target_eval).view(-1)
-            ssim_weighted = (ssim_per_batch * aux_weight).mean()
+            # Healthy SSIM: whole-volume SSIM (BraSyn-style healthy proxy)
+            healthy_ssim = self.ssim_loss(pred_eval, target_eval).view(-1)
+            healthy_weighted = (healthy_ssim * aux_weight).mean()
+            total = total + self.healthy_ssim_weight * healthy_weighted
+            parts["healthy_ssim_loss"] = healthy_weighted.item()
 
-            total = total + self.ssim_weight * ssim_weighted
-            parts["ssim_loss"] = ssim_weighted.item()
+            # Tumor SSIM: SSIM on tumor bounding-box crop, when available
+            bbox = _tumor_bbox_or_none(tumor_mask)
+            if bbox is not None and self.tumor_ssim_weight > 0.0:
+                d0, d1, h0, h1, w0, w1 = bbox
+                pred_tumor = pred_eval[:, :, d0:d1, h0:h1, w0:w1]
+                target_tumor = target_eval[:, :, d0:d1, h0:h1, w0:w1]
+                tumor_ssim = self.ssim_loss(pred_tumor, target_tumor).view(-1)
+                tumor_weighted = (tumor_ssim * aux_weight).mean()
+                total = total + self.tumor_ssim_weight * tumor_weighted
+                parts["tumor_ssim_loss"] = tumor_weighted.item()
+                parts["tumor_ssim_active"] = 1.0
+            else:
+                # Logged so you can see how often tumor SSIM is firing
+                parts["tumor_ssim_loss"] = 0.0
+                parts["tumor_ssim_active"] = 0.0
 
         # Diagnostics
         parts["aux_w_mean"] = float(aux_weight.mean().item())

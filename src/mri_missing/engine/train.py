@@ -24,7 +24,7 @@ from mri_missing.metrics.image_metrics import ImageMetricBundle
 from mri_missing.utils.visualization import save_history_plots
 from mri_missing.losses.image_losses import CompositeSynthesisLoss
 from mri_missing.utils.ema import EMA
-from mri_missing.utils.cases import NUM_MODALITIES
+from mri_missing.utils.cases import NUM_MODALITIES, split_train_cases
 
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -198,8 +198,80 @@ def main():
     ensure_dir(log_dir)
     save_config_copy(cfg, os.path.join(run_dir, "config.yaml"))
 
+    # ----------------------------------------------------------------------
+    # Internal train/val split.
+    #
+    # BraTS validation cases ship without segmentation masks, so we can't
+    # compute tumor-region metrics on them. Instead, we hold out a fraction
+    # of the training cases as internal validation. The split is deterministic
+    # from cfg.data.internal_val_seed, so the same cases land in val across
+    # runs — letting us compare v3 / v6 / future experiments on the same
+    # yardstick.
+    #
+    # When cfg.data.use_internal_val is False, behavior falls back to the
+    # original train_cache / val_cache split (no tumor val metrics).
+    # ----------------------------------------------------------------------
+    use_internal_val = cfg["data"].get("use_internal_val", False)
+
+    if use_internal_val:
+        train_cache_dir = (
+            cfg["data"]["train_cache_root"]
+            if cfg["data"]["backend"] == "pt_cache"
+            else cfg["data"]["train_root"]
+        )
+        # Discover all training case IDs (strip path + .pt extension)
+        if cfg["data"]["backend"] == "pt_cache":
+            all_train_ids = [
+                f.replace(".pt", "") for f in os.listdir(train_cache_dir) if f.endswith(".pt")
+            ]
+        else:
+            all_train_ids = [
+                d for d in os.listdir(train_cache_dir)
+                if os.path.isdir(os.path.join(train_cache_dir, d))
+            ]
+
+        split_seed = cfg["data"].get("internal_val_seed", 42)
+        val_fraction = cfg["data"].get("internal_val_fraction", 0.12)
+        train_ids, val_ids = split_train_cases(
+            all_train_ids, seed=split_seed, val_fraction=val_fraction
+        )
+
+        print(f"\n[internal val] Split seed={split_seed}, val_fraction={val_fraction}")
+        print(f"[internal val] {len(train_ids)} train / {len(val_ids)} val (from {len(all_train_ids)} total)")
+        print(f"[internal val] Sample val IDs: {sorted(val_ids)[:5]}\n")
+
+        # Save the split alongside the run config so later runs/inference
+        # can reproduce the same val set without recomputing.
+        save_json(
+            os.path.join(run_dir, "internal_val_split.json"),
+            {
+                "seed": split_seed,
+                "val_fraction": val_fraction,
+                "train_ids": sorted(train_ids),
+                "val_ids": sorted(val_ids),
+            },
+        )
+
+        train_root_for_ds = train_cache_dir
+        val_root_for_ds = train_cache_dir
+        train_include = train_ids
+        val_include = val_ids
+    else:
+        train_root_for_ds = (
+            cfg["data"]["train_cache_root"]
+            if cfg["data"]["backend"] == "pt_cache"
+            else cfg["data"]["train_root"]
+        )
+        val_root_for_ds = (
+            cfg["data"]["val_cache_root"]
+            if cfg["data"]["backend"] == "pt_cache"
+            else cfg["data"]["val_root"]
+        )
+        train_include = None
+        val_include = None
+
     train_ds = BraTSDataset(
-        cfg["data"]["train_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["train_root"],
+        train_root_for_ds,
         patch_size=tuple(cfg["patch"]["size"]),
         fill_value=cfg["missing_policy"]["fill_value"],
         use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
@@ -207,19 +279,22 @@ def main():
         backend=cfg["data"]["backend"],
         augmentation=cfg.get("augmentation", {}),
         tumor_crop_prob=cfg.get("missing_policy", {}).get("tumor_crop_prob", 0.0),
+        include_ids=train_include,
     )
 
     val_aug_cfg = dict(cfg.get("augmentation", {}))
     val_aug_cfg["enabled"] = False
 
     val_ds = BraTSDataset(
-        cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
+        val_root_for_ds,
         patch_size=tuple(cfg["patch"]["size"]),
         fill_value=cfg["missing_policy"]["fill_value"],
         use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
         sampling_probs={"t1": 0.0, "t1ce": 0.5, "t2": 0.0, "flair": 0.5},
         backend=cfg["data"]["backend"],
         augmentation=val_aug_cfg,
+        tumor_crop_prob=0.0,
+        include_ids=val_include,
     )
 
     train_loader = DataLoader(
@@ -313,10 +388,8 @@ def main():
         use_mae=cfg["loss"]["use_mae"],
         mae_weight=cfg["loss"]["mae_weight"],
         use_ssim=cfg["loss"]["use_ssim"],
-        ssim_weight=cfg["loss"]["ssim_weight"],
-        use_raw_mae=cfg["loss"].get("use_raw_mae", True),
-        raw_mae_weight=cfg["loss"].get("raw_mae_weight", 0.5),
-        tumor_weight=cfg["loss"].get("tumor_weight", 3.0),
+        healthy_ssim_weight=cfg["loss"].get("healthy_ssim_weight", 1.0),
+        tumor_ssim_weight=cfg["loss"].get("tumor_ssim_weight", 1.0),
         min_snr_gamma=cfg["loss"].get("min_snr_gamma", 0.5),
     )
 
@@ -497,11 +570,11 @@ def main():
                         f"step={step} "
                         f"loss={loss.item():.6f} "
                         f"noise_mse={loss_parts.get('noise_mse', 0):.6f} "
-                        f"raw_mae={loss_parts.get('raw_mae', 0):.6f} "
                         f"mae_loss={loss_parts.get('mae_loss', 0):.6f} "
-                        f"ssim_loss={loss_parts.get('ssim_loss', 0):.6f} "
+                        f"healthy_ssim={loss_parts.get('healthy_ssim_loss', 0):.6f} "
+                        f"tumor_ssim={loss_parts.get('tumor_ssim_loss', 0):.6f} "
+                        f"t_active={loss_parts.get('tumor_ssim_active', 0):.0f} "
                         f"aux_w={loss_parts.get('aux_w_mean', 0):.3f} "
-                        f"tumor_frac={loss_parts.get('tumor_frac', 0):.3f} "
                         f"missing={missing_str} "
                         f"lr={lr:.6e} "
                         f"time={step_time:.3f}s "
@@ -543,13 +616,16 @@ def main():
                     t_loss = val_stats.get('val_total_loss', 0)
                     n_mse = val_stats.get('val_noise_mse', 0)
                     m_loss = val_stats.get('val_mae_loss', 0)
-                    s_loss = val_stats.get('val_ssim_loss', 0)
+                    h_ssim_loss = val_stats.get('val_healthy_ssim_loss', 0)
+                    t_ssim_loss = val_stats.get('val_tumor_ssim_loss', 0)
 
                     if do_heavy_val:
                         print(
-                            f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
+                            f"Total Loss:  {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
                         print(
-                            f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
+                            f"MAE Loss:    {m_loss:>8.6f}  |  Healthy SSIM L: {h_ssim_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
+                        print(
+                            f"Tumor SSIM L:{t_ssim_loss:>8.6f}")
                         # Region-level breakouts when tumor masks are available
                         tumor_ssim = val_stats.get("val_tumor_ssim")
                         healthy_ssim = val_stats.get("val_healthy_ssim")
@@ -573,8 +649,9 @@ def main():
                                     )
                         print(f"{'=' * 50}\n")
                     else:
-                        print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}")
-                        print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}")
+                        print(f"Total Loss:  {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}")
+                        print(f"MAE Loss:    {m_loss:>8.6f}  |  Healthy SSIM L: {h_ssim_loss:>8.6f}")
+                        print(f"Tumor SSIM L:{t_ssim_loss:>8.6f}")
                         print(f"{'=' * 46}\n")
 
                     if val_stats["val_noise_mse"] < best_val:
