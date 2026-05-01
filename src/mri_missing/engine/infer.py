@@ -87,6 +87,22 @@ def prepare_condition(cfg, data_dict, missing_key):
 
     return cond, target
 
+def pad_to_multiple_3d(x, multiple=32, value=-1.0, mode="constant"):
+    _, _, d, h, w = x.shape
+    d_pad = (multiple - (d % multiple)) % multiple
+    h_pad = (multiple - (h % multiple)) % multiple
+    w_pad = (multiple - (w % multiple)) % multiple
+    pad = (0, w_pad, 0, h_pad, 0, d_pad)
+    x_pad = F.pad(x, pad, mode=mode, value=value)
+    return x_pad, pad
+
+def unpad_3d(x, pad):
+    _, w_pad, _, h_pad, _, d_pad = pad
+    if d_pad > 0: x = x[:, :, :-d_pad, :, :]
+    if h_pad > 0: x = x[:, :, :, :-h_pad, :]
+    if w_pad > 0: x = x[:, :, :, :, :-w_pad]
+    return x
+
 
 def resolve_checkpoint_path(cfg):
     '''Determines the checkpoint path to load for inference based on config settings.'''
@@ -168,7 +184,7 @@ def build_available_support_mask(cond_np, missing_key):
 
 @torch.inference_mode()
 def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
-    '''Runs inference on a single case and returns the prediction, target, condition, and metadata.'''
+    '''Runs inference on a single case using a Gaussian sliding window to protect VRAM and eliminate seams.'''
     data_dict, affine, header = load_case(case_dir)
 
     raw_data_dict = {k: v.copy() for k, v in data_dict.items()}
@@ -179,7 +195,6 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     cond_np, target_np = prepare_condition(cfg, norm_data_dict, missing_key)
 
-    # Correct leak-free support: use available IMAGE channels, not presence mask voxels
     available_mask = build_available_support_mask(cond_np, missing_key)
 
     coords = np.argwhere(available_mask)
@@ -195,28 +210,14 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     cond = torch.tensor(cond_crop[None], dtype=torch.float32, device=device)
 
-    # Pad image channels and presence-mask channels differently
-    if cond.shape[1] >= 8:
-        cond_img = cond[:, :4]
-        cond_pres = cond[:, 4:8]
-
-        cond_img, pad_info = pad_to_multiple_3d(cond_img, multiple=32, value=-1.0)
-        cond_pres, _ = pad_to_multiple_3d(cond_pres, multiple=32, value=0.0, mode="replicate")
-
-        cond = torch.cat([cond_img, cond_pres], dim=1)
-    else:
-        cond, pad_info = pad_to_multiple_3d(cond, multiple=32, value=-1.0)
-
-    # Sample x directly at padded size instead of padding with -1
+    # No manual padding needed! Sliding window handles dimensions perfectly.
     x = torch.randn((1, 1, *cond.shape[2:]), device=device)
-
-    # beta_schedule = "squaredcos_cap_v2" if cfg["diffusion"].get("schedule") == "cosine" else "linear"
 
     trained_betas_np = diffusion.betas.detach().cpu().numpy()
 
     scheduler = DDIMScheduler(
         trained_betas=trained_betas_np,
-        beta_schedule="scaled_linear", # CRITICAL FIX
+        beta_schedule="scaled_linear",
         clip_sample=True,          
         clip_sample_range=1.0,     
     )
@@ -233,10 +234,9 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     use_class_embed = cfg["model"].get("use_target_class_embed", True)
     guidance_scale = cfg["inference"].get("cfg_guidance_scale", 1.0)
     
-    # Map the missing modality string to our training integer
     mod_to_idx = {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
     target_idx = torch.tensor([mod_to_idx[missing_key]], device=device, dtype=torch.long)
-    null_idx = torch.tensor([4], device=device, dtype=torch.long) # 4 is the null token
+    null_idx = torch.tensor([4], device=device, dtype=torch.long)
 
     for t_idx in scheduler.timesteps:
         t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
@@ -244,48 +244,61 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
             if guidance_scale > 1.0:
-                # --- Classifier-Free Guidance (Double Pass) ---
-                cond_zero = torch.zeros_like(cond) # Blind context for unconditional pass
+                cond_zero = torch.zeros_like(cond)
                 
-                if use_sw:
-                    def pred_cond_fn(patch_in): return model(patch_in, t, class_labels=target_idx if use_class_embed else None)
-                    def pred_uncond_fn(patch_in): return model(patch_in, t, class_labels=null_idx if use_class_embed else None)
+                # Wrap predictors to safely expand batch sizes for the sliding window
+                def pred_cond_fn(patch_in): 
+                    bs = patch_in.shape[0]
+                    return model(patch_in, t.expand(bs), class_labels=target_idx.expand(bs) if use_class_embed else None)
                     
-                    noise_cond = sliding_window_inference(inputs=torch.cat([cond, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size, predictor=pred_cond_fn, overlap=overlap, mode="constant")
-                    noise_uncond = sliding_window_inference(inputs=torch.cat([cond_zero, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size, predictor=pred_uncond_fn, overlap=overlap, mode="constant")
-                else:
-                    noise_cond = model(torch.cat([cond, x], dim=1), t, class_labels=target_idx if use_class_embed else None)
-                    noise_uncond = model(torch.cat([cond_zero, x], dim=1), t, class_labels=null_idx if use_class_embed else None)
+                def pred_uncond_fn(patch_in): 
+                    bs = patch_in.shape[0]
+                    return model(patch_in, t.expand(bs), class_labels=null_idx.expand(bs) if use_class_embed else None)
                 
-                # CFG Extrapolation Math
+                # --- CRITICAL FIX: mode="gaussian" ---
+                noise_cond = sliding_window_inference(
+                    inputs=torch.cat([cond, x], dim=1), 
+                    roi_size=roi_size, 
+                    sw_batch_size=sw_batch_size, 
+                    predictor=pred_cond_fn, 
+                    overlap=overlap, 
+                    mode="gaussian"
+                )
+                noise_uncond = sliding_window_inference(
+                    inputs=torch.cat([cond_zero, x], dim=1), 
+                    roi_size=roi_size, 
+                    sw_batch_size=sw_batch_size, 
+                    predictor=pred_uncond_fn, 
+                    overlap=overlap, 
+                    mode="gaussian"
+                )
+                
                 pred_noise = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
             else:
-                # --- Standard Inference (No CFG) ---
-                if use_sw:
-                    def predictor(patch_in): return model(patch_in, t, class_labels=target_idx if use_class_embed else None)
-                    pred_noise = sliding_window_inference(inputs=torch.cat([cond, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size, predictor=predictor, overlap=overlap, mode="constant")
-                else:
-                    pred_noise = model(torch.cat([cond, x], dim=1), t, class_labels=target_idx if use_class_embed else None)
+                def predictor(patch_in): 
+                    bs = patch_in.shape[0]
+                    return model(patch_in, t.expand(bs), class_labels=target_idx.expand(bs) if use_class_embed else None)
+                    
+                pred_noise = sliding_window_inference(
+                    inputs=torch.cat([cond, x], dim=1), 
+                    roi_size=roi_size, 
+                    sw_batch_size=sw_batch_size, 
+                    predictor=predictor, 
+                    overlap=overlap, 
+                    mode="gaussian"
+                )
 
-        # DDIM math in float32 outside autocast to preserve numerical stability
         x = scheduler.step(pred_noise.float(), t_idx, x.float()).prev_sample
 
     elapsed = time.time() - start
 
-    x = unpad_3d(x, pad_info)
-
     pred_crop = x[0, 0].detach().float().cpu().numpy()
-    
-    # --- FIX: Clamp the final clean prediction here! ---
     pred_crop = np.clip(pred_crop, -1.0, 1.0)
 
-    # Build the full volume
     pred_full = np.full_like(target_np, -1.0, dtype=np.float32)
     pred_full[d0:d1, h0:h1, w0:w1] = pred_crop
 
-    # Mask out real background correctly
     pred_full = np.where(available_mask, pred_full, -1.0)
-
     eval_mask_full = available_mask.astype(np.float32)
 
     return (
@@ -299,8 +312,6 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
         raw_data_dict,
         eval_mask_full,
     )
-
-
 def main():
     cfg = load_config("configs/base.yaml")
 
@@ -395,6 +406,13 @@ def main():
             mask_t = torch.tensor(eval_mask[None, None], dtype=torch.float32)
 
             infer_metrics = metric_bundle(pred_t, target_t, mask=mask_t)
+            # --- NEW: Parallel Full-Volume Metrics ---
+            if cfg["metrics"].get("compute_full_volume", False):
+                # Passing mask=None forces evaluation over the entire tensor
+                full_metrics = metric_bundle(pred_t, target_t, mask=None)
+                for k, v in full_metrics.items():
+                    infer_metrics[f"full_{k}"] = v
+            # -----------------------------------------
 
             item_dir = os.path.join(base_out, f"{case_id}_{missing_key}")
             ensure_dir(item_dir)

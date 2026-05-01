@@ -71,7 +71,7 @@ train:
   log_every: 100 # also controls how often to plot metrics - consider implementing rolling average for smoother curves
   use_amp: true
   use_compile: false   # Set to false on Windows, true on Linux
-  resume:  # path to checkpoint or null
+  resume: outputs\20260501_005806_monai_diffusion\checkpoints\latest.pt # path to checkpoint or null
 
 inference:
   checkpoint_path: null
@@ -87,13 +87,14 @@ inference:
   save_nifti: false
   save_composite_nifti: false # saves a nifti with all channels (cond + pred)
   save_png: true
-  reverse_steps: 100 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
+  reverse_steps: 50 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
+  cfg_guidance_scale: 3.5 # Classifier-Free Guidance scale; 2.0 is a good starting point for medical imaging, but may need to be tuned
 
   sliding_window:
-    enabled: true # not 100% yet, but I think we leave this off for swin
+    enabled: true # required for 5080. Uses gaussian weighting and overlapping windows
     roi_size: [96, 96, 32]
     sw_batch_size: 2
-    overlap: 0.5
+    overlap: 0.5 # required for gaussian weighting
 
 validation: # determine how often we plot metrics during training
   light_every: 1000
@@ -109,6 +110,7 @@ metrics:
   compute_ssim: true
   eval_norm: per_case_minmax
   raw_eval_norm: none   # none | per_case_minmax | global_minmax
+  compute_full_volume: true
 
 checkpoint:
   top_k_heavy: 3
