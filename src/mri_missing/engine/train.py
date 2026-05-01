@@ -436,7 +436,7 @@ def main():
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
         model_kwargs["use_flash_attention"] = cfg["model"].get("use_flash_attention", False)
         if cfg["model"].get("use_target_class_embed", False):
-            model_kwargs["num_class_embeds"] = 4
+            model_kwargs["num_class_embeds"] = 5
 
     elif model_name == "swin":
         # Force img_size to perfectly match the patch size to avoid window mismatches

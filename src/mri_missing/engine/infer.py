@@ -127,6 +127,9 @@ def build_infer_model(cfg, device):
         model_kwargs["resblock_updown"] = cfg["model"].get("resblock_updown", False)
         model_kwargs["transformer_num_layers"] = cfg["model"].get("transformer_num_layers", 1)
         model_kwargs["dropout_cattn"] = cfg["model"].get("dropout_cattn", 0.0)
+        # --- NEW: Inject the class embedder size (Update to 5!) ---
+        if cfg["model"].get("use_target_class_embed", True):
+            model_kwargs["num_class_embeds"] = 4 # 0=T1, 1=T1ce, 2=T2, 3=FLAIR, 4=NULL
 
     elif model_name == "swin_ddpm":
         model_kwargs["img_size"] = tuple(cfg["patch"]["size"])
@@ -227,7 +230,7 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     start = time.time()
     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-    use_class_embed = cfg["model"].get("use_target_class_embed", False)
+    use_class_embed = cfg["model"].get("use_target_class_embed", True)
     guidance_scale = cfg["inference"].get("cfg_guidance_scale", 1.0)
     
     # Map the missing modality string to our training integer
@@ -358,10 +361,16 @@ def main():
         random_case_seed=cfg["inference"].get("random_case_seed", 42),
     )
 
+    # --- NEW: Generate a Unique Run ID ---
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    custom_run_name = cfg["inference"].get("run_name", "run")
+    unique_run_id = f"{custom_run_name}_{timestamp}"
+
     base_out = os.path.join(
         cfg["project"]["output_root"],
         cfg["inference"]["output_subdir"],
         cfg["model"]["name"],
+        unique_run_id # <--- Nests everything safely inside a unique folder!
     )
     ensure_dir(base_out)
 

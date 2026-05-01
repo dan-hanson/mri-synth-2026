@@ -40,7 +40,7 @@ model:
   transformer_num_layers: 1
   use_flash_attention: false
   use_target_class_embed: true
-  
+
 diffusion:
   timesteps: 1000
   schedule: "scaled_linear_beta" # MONAI's standard for high-res synthesis
@@ -76,10 +76,10 @@ train:
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260413_011658_swin_ddpm"
-  checkpoint_name: best_noise.pt
+  run_dir: "outputs/20260501_005806_monai_diffusion"
+  checkpoint_name: top_heavy_step_0084000.pt
   data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
-  case_ids: [] # if empty, will run on all cases in data_root; otherwise specify list of case IDs to run
+  case_ids: [BraTS-GLI-00001-000] # if empty, will run on all cases in data_root; otherwise specify list of case IDs to run
   random_case_count: 1
   random_case_seed: 42
   missing_keys: ["t1ce"] # e.g. ["t1", "t1ce", "t2", "flair"]
@@ -87,13 +87,13 @@ inference:
   save_nifti: false
   save_composite_nifti: false # saves a nifti with all channels (cond + pred)
   save_png: true
-  reverse_steps: 50 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
+  reverse_steps: 100 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
 
   sliding_window:
     enabled: true # not 100% yet, but I think we leave this off for swin
-    roi_size: [128, 128, 64]
-    sw_batch_size: 1
-    overlap: 0.0
+    roi_size: [96, 96, 32]
+    sw_batch_size: 2
+    overlap: 0.5
 
 validation: # determine how often we plot metrics during training
   light_every: 1000
