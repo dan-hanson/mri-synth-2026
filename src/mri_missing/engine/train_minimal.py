@@ -6,8 +6,9 @@ from torch.utils.data import DataLoader
 import torch
 torch.backends.cudnn.benchmark = True
 
-sys.path.append(r"C:\mri_synth_2026\src")
+import _path_bootstrap  # noqa: F401  (must come before mri_missing.*)
 
+from mri_missing.config import load_config
 from mri_missing.diffusion.scheduler import DiffusionScheduler
 from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 from mri_missing.data.dataset import BraTSDataset
@@ -15,7 +16,10 @@ from mri_missing.models.unet_denoiser import TinyUNet3D
 from mri_missing.models.registry import build_model
 
 
-DATA_ROOT = r"C:\mri_synth_2026\data\GLI\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+# Pull the data root from the same YAML the rest of the pipeline uses so we
+# don't have a separate source of truth for this script.
+_cfg = load_config("configs/base.yaml")
+DATA_ROOT = _cfg["data"]["train_root"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 scheduler = DiffusionScheduler().to(DEVICE)

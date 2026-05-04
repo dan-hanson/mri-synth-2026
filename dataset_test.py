@@ -1,10 +1,13 @@
 import os
+
 import nibabel as nib
 import numpy as np
 import torch
 
-# ---- CHANGE THIS ----
-DATA_ROOT = r"C:\mri_synth_2026\data\GLI\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+import _path_bootstrap  # noqa: F401  (must come before mri_missing.*)
+
+from mri_missing.config import load_config
+
 
 def load_case(case_path):
     modalities = {
@@ -39,6 +42,7 @@ def load_case(case_path):
 
     return modalities
 
+
 def normalize(x):
     x = (x - np.mean(x)) / (np.std(x) + 1e-8)
     return x
@@ -63,8 +67,12 @@ def random_missing(mods):
 
 
 def main():
-    cases = os.listdir(DATA_ROOT)
-    case_path = os.path.join(DATA_ROOT, cases[0])
+    # Pull the data root from the same YAML the rest of the pipeline uses.
+    cfg = load_config("configs/base.yaml")
+    data_root = cfg["data"]["train_root"]
+
+    cases = os.listdir(data_root)
+    case_path = os.path.join(data_root, cases[0])
 
     mods = load_case(case_path)
 

@@ -1,7 +1,7 @@
 project:
   name: mri_missing_modality
-  output_root: outputs
-  run_name: null   # if null, auto-generate
+  output_root: outputs            # relative to project root
+  run_name: COMBO_02              # if null, auto-generate
 
 mode: train   # train | infer | validate --> not currently in use
 
@@ -10,12 +10,15 @@ seed:
   deterministic: false # if true, sets cudnn_deterministic to True and cudnn_benchmark to False for reproducibility
 
 data:
-  train_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
-  val_root: C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData
+  # All paths below are relative to the project root (the folder containing
+  # configs/, data/, cache/, etc.). They are auto-resolved by load_config().
+  # Absolute paths still work if you want data on a different disk.
+  train_root: data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
+  val_root:   data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData
 
   backend: pt_cache   # nifti | pt_cache
-  train_cache_root: C:/mri_synth_2026/cache/train
-  val_cache_root: C:/mri_synth_2026/cache/val
+  train_cache_root: cache/train
+  val_cache_root:   cache/val
 
 loader:
   batch_size: 1
@@ -25,13 +28,13 @@ loader:
   persistent_workers: true # can speed up dataloader
 
 patch:
-  size: [96, 96, 32] #could increase this if you have room. I wouldn't worry about this as much for this run. 
+  size: [96, 96, 32] #could increase this if you have room. I wouldn't worry about this as much for this run.
 
 model:
   name: "monai_diffusion"
-  in_channels: 9          
-  out_channels: 1         
-  channels: [96, 192, 384, 512]  
+  in_channels: 9
+  out_channels: 1
+  channels: [96, 192, 384, 512]
   attention_levels: [False, False, False, True] # Attention ONLY at the deepest bottleneck
   num_res_blocks: 2
   num_head_channels: 64 # Required for the attention block mapping
@@ -53,7 +56,7 @@ optim:
   weight_decay: 0.0001
 
 scheduler:
-  name: "constant_with_warmup" 
+  name: "constant_with_warmup"
   warmup_steps: 2500 # Gently ramps up to 5e-5, then stays perfectly flat forever
   # t_max and eta_min are ignored by this scheduler
 
@@ -65,41 +68,47 @@ augmentation:
   rotation_prob: 0.5 # rotatio by 90 degree increments along z axis
 
 train:
-  max_steps: 100000 # if using gradient accumulation, adjust t_max in scheduler accordingly
+  max_steps: 300000 # if using gradient accumulation, adjust t_max in scheduler accordingly
   accumulate_grad_batches: 2 # effective batch size will be batch_size * accumulated_grad_batches
-  save_every: 1000 
-  log_every: 100 # also controls how often to plot metrics - consider implementing rolling average for smoother curves
+  save_every: 1000
+  log_every: 1000 # also controls how often to plot metrics - consider implementing rolling average for smoother curves
   use_amp: true
-  use_compile: false   # Set to false on Windows, true on Linux
-  resume: outputs\20260501_005806_monai_diffusion\checkpoints\latest.pt # path to checkpoint or null
+  use_compile: true   # Set to false on Windows, true on Linux
+  resume: outputs/COMBO_00/checkpoints/latest.pt # path to checkpoint or null (relative to project root)
 
 inference:
   checkpoint_path: null
   use_compile: false
-  run_dir: "outputs/20260501_005806_monai_diffusion"
-  checkpoint_name: top_heavy_step_0084000.pt
-  data_root: "C:/mri_synth_2026/data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData"
+  run_dir: outputs/COMBO_01      # relative to project root
+  checkpoint_name: top_heavy_step_0198000.pt
+  data_root: data/GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData  # relative to project root
   case_ids: [BraTS-GLI-00001-000] # if empty, will run on all cases in data_root; otherwise specify list of case IDs to run
   random_case_count: 1
   random_case_seed: 42
-  missing_keys: ["t1ce"] # e.g. ["t1", "t1ce", "t2", "flair"]
+  missing_keys: ["t1ce"] # e.g. ["t1", "t1ce", "t2", "flair"] (ignored if using panel_mode: "grid")
   output_subdir: inference
   save_nifti: false
   save_composite_nifti: false # saves a nifti with all channels (cond + pred)
-  save_png: true
-  reverse_steps: 50 # 50 seemed like the sweet spot, but may need to test higher / lower after more training
-  cfg_guidance_scale: 3.5 # Classifier-Free Guidance scale; 2.0 is a good starting point for medical imaging, but may need to be tuned
+  save_png: true # saves a png (controlled by panel_mode) - good for quick visualization
+  reverse_steps: 30 # You can try going higher or lower, but you many want to adjust the CFG scale accordingly. Fewer steps with higher CFG can still yield good results and will be much faster.
+  cfg_guidance_scale:       # <--- set CFG per modality
+    t1: 1.0
+    t1ce: 3.0
+    t2: 1.0
+    flair: 1.0
+  panel_mode: "grid"        # <--- "slice" (dev mode) | "grid" (paper mode)
+  max_eval_cases: 6  # Set to 0 to run the entire dataset ---> this is for eval.py
 
   sliding_window:
     enabled: true # required for 5080. Uses gaussian weighting and overlapping windows
     roi_size: [96, 96, 32]
     sw_batch_size: 2
-    overlap: 0.5 # required for gaussian weighting
+    overlap: 0.25 # required for gaussian weighting - little to no difference betweeen 0.5 and 0.25
 
 validation: # determine how often we plot metrics during training
   light_every: 1000
   heavy_every: 2000 # needed for topk checkpointing - can go higher for faster training, lower for more checkpoint oportunities
-  
+
 runtime:
   device: cuda
   cudnn_benchmark: true
@@ -143,7 +152,7 @@ checkpoint:
 missing_policy:
   fill_value: -1.0
   use_presence_mask: true
-  sampling_probs: # 0.25 seems fine for now 
+  sampling_probs: # 0.25 seems fine for now
     t1: 0.25
     t1ce: 0.25
     t2: 0.25
@@ -163,7 +172,7 @@ loss:
 
 ema:
   enabled: true # improves quality by updating a shadow model in kept in VRAM. Should be safe unless unless the model is massive and VRAM is extremely tight
-  decay: 0.9995 # determines EMA update speed; close to 1.0 means slow updates and more stable EMA weights -> I used 0.9999, but for 100k allowing it to update faster my be beneficial. 
+  decay: 0.9995 # determines EMA update speed; close to 1.0 means slow updates and more stable EMA weights -> I used 0.9999, but for 100k allowing it to update faster my be beneficial.
   validate_with_ema: true
   infer_with_ema: true
 

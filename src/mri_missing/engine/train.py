@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import concurrent.futures
 
-sys.path.append(r"C:\mri_synth_2026\src")
+import _path_bootstrap  # noqa: F401  (must come before mri_missing.*)
 
 from mri_missing.config import load_config, ensure_dir, make_run_dir, save_config_copy
 from mri_missing.seed import seed_everything
@@ -27,13 +27,15 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-def heavy_rank_key(val_stats): # *** probably could be improved with a more complex weighted formula ***
+
+def heavy_rank_key(val_stats):  # *** probably could be improved with a more complex weighted formula ***
     '''Ranking key for heavy validation checkpoints. Prioritizes SSIM, then MAE, then noise MSE.'''
     return (
         float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", -1e9))),
         -float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 1e9))),
         -float(val_stats.get("val_noise_mse", 1e9)),
     )
+
 
 def _norm_high(x, lo, hi):
     if hi <= lo:
@@ -102,10 +104,10 @@ def heavy_rank_score(val_stats, cfg):
     w_noise = float(ckpt_cfg.get("w_noise", 0.15))
 
     score = (
-        w_ssim * ssim_term +
-        w_psnr * psnr_term +
-        w_mae * mae_term +
-        w_noise * noise_term
+            w_ssim * ssim_term +
+            w_psnr * psnr_term +
+            w_mae * mae_term +
+            w_noise * noise_term
     )
 
     # Keep a tuple so ties are still resolved sensibly
@@ -117,10 +119,11 @@ def heavy_rank_score(val_stats, cfg):
         -float(noise),
     )
 
+
 def make_light_val_batch(val_loader, device=None):
     '''Extract a single batch from the validation loader for quick, frequent validation during training.'''
     batch = next(iter(val_loader))
-    cond, target, keys, target_idx, case_ids = batch # Unpack 5 vars
+    cond, target, keys, target_idx, case_ids = batch  # Unpack 5 vars
     return [(cond.clone(), target.clone(), keys, target_idx.clone(), case_ids)]
 
 
@@ -150,15 +153,18 @@ def build_scheduler(cfg, optimizer):
         )
     elif name == "constant_with_warmup":
         warmup_steps = cfg["scheduler"].get("warmup_steps", 2500)
+
         def lr_lambda(current_step):
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
             return 1.0  # Stay flat after warmup
+
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif name == "none":
         return None
     else:
         raise ValueError(f"Unknown scheduler: {name}")
+
 
 def should_stop(run_dir, cfg):
     '''Check if a stop file exists in the run directory, indicating that training should be halted.'''
@@ -166,21 +172,22 @@ def should_stop(run_dir, cfg):
     stop_path = os.path.join(run_dir, stop_file)
     return os.path.exists(stop_path)
 
+
 @torch.inference_mode()
 def validate(
-    model,
-    batches,
-    scheduler,
-    loss_fn,
-    metric_bundle,
-    device,
-    use_amp,
-    timesteps,
-    compute_heavy=False,
-    current_step=0,
-    max_steps=1,
-    reverse_steps=15,
-    raw_metric_bundle=None,
+        model,
+        batches,
+        scheduler,
+        loss_fn,
+        metric_bundle,
+        device,
+        use_amp,
+        timesteps,
+        compute_heavy=False,
+        current_step=0,
+        max_steps=1,
+        reverse_steps=15,
+        raw_metric_bundle=None,
 ):
     was_training = model.training
     model.eval()
@@ -201,7 +208,7 @@ def validate(
         trained_betas_np = scheduler.betas.detach().cpu().numpy()
         ddim_scheduler = DDIMScheduler(
             trained_betas=trained_betas_np,
-            beta_schedule="scaled_linear", # <-- CRITICAL ADDITION
+            beta_schedule="scaled_linear",  # <-- CRITICAL ADDITION
             clip_sample=True,
             clip_sample_range=1.0,
         )
@@ -216,7 +223,7 @@ def validate(
 
         cond = cond.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-        target_idx = target_idx.to(device, non_blocking=True) # Send to GPU
+        target_idx = target_idx.to(device, non_blocking=True)  # Send to GPU
 
         # -----------------------------
         # light validation forward pass
@@ -233,8 +240,8 @@ def validate(
         snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
 
         pred_x0_1step = (
-            x_t.float() - torch.sqrt(1.0 - alpha_bar) * pred_noise.float()
-        ) / (torch.sqrt(alpha_bar) + 1e-5)
+                                x_t.float() - torch.sqrt(1.0 - alpha_bar) * pred_noise.float()
+                        ) / (torch.sqrt(alpha_bar) + 1e-5)
         pred_x0_1step = torch.clamp(pred_x0_1step, min=-1.0, max=1.0)
 
         total_loss, loss_parts = loss_fn(
@@ -272,21 +279,21 @@ def validate(
                     )
 
                     model_in = torch.cat([cond, x_gen], dim=1)
-                    
+
                     # Pass class_labels!
-                    p_noise = model(model_in, t_tensor, class_labels=target_idx) 
+                    p_noise = model(model_in, t_tensor, class_labels=target_idx)
 
                     x_gen = ddim_scheduler.step(p_noise, t_idx, x_gen).prev_sample
 
             for b in range(target.shape[0]):
                 mod = keys[b] if isinstance(keys, (list, tuple)) else keys
-                p_b = x_gen[b:b+1]
-                t_b = target[b:b+1]
+                p_b = x_gen[b:b + 1]
+                t_b = target[b:b + 1]
 
                 if cond.shape[1] >= 8:
-                    mask_b = (cond[b:b+1, 4:8] > 0.5).any(dim=1, keepdim=True).float()
+                    mask_b = (cond[b:b + 1, 4:8] > 0.5).any(dim=1, keepdim=True).float()
                 else:
-                    mask_b = (cond[b:b+1, :4] > -0.999).any(dim=1, keepdim=True).float()
+                    mask_b = (cond[b:b + 1, :4] > -0.999).any(dim=1, keepdim=True).float()
 
                 metrics = metric_bundle(p_b, t_b, mask=mask_b)
                 for k, v in metrics.items():
@@ -348,15 +355,15 @@ def main():
     val_aug_cfg["enabled"] = False
 
     val_ds = BraTSDataset(
-            cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
-            patch_size=tuple(cfg["patch"]["size"]),
-            fill_value=cfg["missing_policy"]["fill_value"],
-            use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
-            # Force Validation to ONLY test the hard modalities
-            sampling_probs={"t1": 0.15, "t1ce": 0.30, "t2": 0.25, "flair": 0.30},
-            backend=cfg["data"]["backend"],
-            augmentation=val_aug_cfg,
-        )
+        cfg["data"]["val_cache_root"] if cfg["data"]["backend"] == "pt_cache" else cfg["data"]["val_root"],
+        patch_size=tuple(cfg["patch"]["size"]),
+        fill_value=cfg["missing_policy"]["fill_value"],
+        use_presence_mask=cfg["missing_policy"]["use_presence_mask"],
+        # Force Validation to ONLY test the hard modalities
+        sampling_probs={"t1": 0.15, "t1ce": 0.30, "t2": 0.25, "flair": 0.30},
+        backend=cfg["data"]["backend"],
+        augmentation=val_aug_cfg,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -384,7 +391,7 @@ def main():
     golden_gen = torch.Generator(device="cpu")
     golden_gen.manual_seed(cfg["seed"]["value"] + 123456)
 
-    for cond, target, keys, target_idx, case_ids in val_loader: # Unpack 5 vars
+    for cond, target, keys, target_idx, case_ids in val_loader:  # Unpack 5 vars
         fixed_latent = torch.randn(
             target.shape,
             generator=golden_gen,
@@ -395,7 +402,7 @@ def main():
             cond.clone(),
             target.clone(),
             keys,
-            target_idx.clone(), # Append target_idx
+            target_idx.clone(),  # Append target_idx
             case_ids,
             fixed_latent.clone(),
         ))
@@ -404,7 +411,7 @@ def main():
             break
 
     print(f"Locked {len(golden_batches)} batches. Tracking the following volumes:")
-    for _, _, keys, _, case_ids, _ in golden_batches: 
+    for _, _, keys, _, case_ids, _ in golden_batches:
         for i in range(len(keys)):
             mod = keys[i] if isinstance(keys, (list, tuple)) else keys
             c_id = case_ids[i] if isinstance(case_ids, (list, tuple)) else case_ids
@@ -515,7 +522,7 @@ def main():
 
     start_step = 0
     best_val = float("inf")
-    best_ssim = -float("inf") # track best SSIM separately for clinical checkpoint
+    best_ssim = -float("inf")  # track best SSIM separately for clinical checkpoint
     top_heavy = []
     top_k_heavy = int(cfg.get("checkpoint", {}).get("top_k_heavy", 3))
 
@@ -547,7 +554,7 @@ def main():
 
     # Fetch config value (default to 1 if missing)
     accum_steps = cfg["train"].get("accumulate_grad_batches", 1)
-    
+
     # Initialize zero gradients before the loop starts
     optimizer.zero_grad(set_to_none=True)
 
@@ -558,8 +565,8 @@ def main():
     print("\nGenerating Multi-Augmentation Preview Panel...")
     # Pass the raw train_ds (not the loader) so we can sample it repeatedly
     save_augmentation_panel(
-        train_ds, 
-        os.path.join(run_dir, "00_augmentation_preview.png"), 
+        train_ds,
+        os.path.join(run_dir, "00_augmentation_preview.png"),
         num_samples=5
     )
     print("Preview saved to run directory.\n")
@@ -567,16 +574,16 @@ def main():
 
     # ------------------
     # Main Training Loop
-    #------------------
+    # ------------------
     try:
         cond_dropout_prob = cfg["loss"].get("cond_dropout_prob", 0.0)
         use_class_embed = cfg["model"].get("use_target_class_embed", False)
         # 4 is the out-of-bounds index used as the "null" token for CFG
-        null_label_index = 4 if use_class_embed else None 
+        null_label_index = 4 if use_class_embed else None
 
         while step < cfg["train"]["max_steps"]:
             for cond, target, key, target_idx, current_case_id in train_loader:
-                
+
                 # RESTORED: Stop file logic
                 if should_stop(run_dir, cfg):
                     print("\nStop file detected. Saving checkpoint...")
@@ -604,12 +611,12 @@ def main():
                     drop_mask = torch.rand(cond.shape[0], device=device) < cond_dropout_prob
                     if drop_mask.any():
                         cond_view = cond.clone()
-                        cond_view[drop_mask] = 0.0 # Zero out the context modalities
+                        cond_view[drop_mask] = 0.0  # Zero out the context modalities
                         cond = cond_view
 
                         if null_label_index is not None:
                             target_idx_view = target_idx.clone()
-                            target_idx_view[drop_mask] = null_label_index # Inject null token
+                            target_idx_view[drop_mask] = null_label_index  # Inject null token
                             target_idx = target_idx_view
 
                 x = torch.cat([cond, x_t], dim=1)
@@ -622,8 +629,8 @@ def main():
                 snr = alpha_bar_f32 / (1.0 - alpha_bar_f32 + 1e-8)
 
                 pred_x0 = (
-                    x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
-                ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
+                                  x_t.float() - torch.sqrt(1.0 - alpha_bar_f32) * pred_noise.float()
+                          ) / (torch.sqrt(alpha_bar_f32) + 1e-5)
 
                 pred_x0 = torch.clamp(pred_x0, min=-1.0, max=1.0)
 
@@ -641,7 +648,8 @@ def main():
                 )
 
                 # --- SAFETY CHECKS BEFORE BACKWARD ---
-                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(pred_x0).all():
+                if not torch.isfinite(loss) or not torch.isfinite(pred_noise).all() or not torch.isfinite(
+                        pred_x0).all():
                     print(f"NaN detected at step={step}. Skipping batch and zeroing gradients...")
                     # Dump the poisoned gradients
                     optimizer.zero_grad(set_to_none=True)
@@ -658,19 +666,19 @@ def main():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
-                    
+
                     # Zero gradients AFTER stepping
                     optimizer.zero_grad(set_to_none=True)
-                    
+
                     if ema is not None:
                         ema.update(model)
-                    
+
                     if scheduler_lr is not None:
                         scheduler_lr.step()
 
                 if device == "cuda":
                     torch.cuda.synchronize()
-                
+
                 step_time = step_timer.toc()
                 vram_mb = get_vram_mb() if device == "cuda" else 0.0
                 lr = optimizer.param_groups[0]["lr"]
@@ -743,28 +751,32 @@ def main():
 
                     # --- CONSOLE UI ---
                     prefix = "Val Heavy" if do_heavy_val else "Val Light"
-                    print(f"\n{'='*12} [ {prefix} ] {'='*12}")
-                    
+                    print(f"\n{'=' * 12} [ {prefix} ] {'=' * 12}")
+
                     t_loss = val_stats.get('val_total_loss', 0)
                     n_mse = val_stats.get('val_noise_mse', 0)
                     m_loss = val_stats.get('val_mae_loss', 0)
                     s_loss = val_stats.get('val_ssim_loss', 0)
-                    
+
                     if do_heavy_val:
-                        print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
-                        print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
+                        print(
+                            f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f} ||  Global PSNR: {val_stats.get('val_psnr', 0):>8.4f}")
+                        print(
+                            f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f} ||  Global SSIM: {val_stats.get('val_ssim', 0):>8.4f}")
                         if "val_raw_ssim" in val_stats:
-                            print(f"Raw PSNR:    {val_stats.get('val_raw_psnr', 0):>8.4f}  |  Raw SSIM:   {val_stats.get('val_raw_ssim', 0):>8.4f}  |  Raw MAE: {val_stats.get('val_raw_mae', 0):>8.4f}")
+                            print(
+                                f"Raw PSNR:    {val_stats.get('val_raw_psnr', 0):>8.4f}  |  Raw SSIM:   {val_stats.get('val_raw_ssim', 0):>8.4f}  |  Raw MAE: {val_stats.get('val_raw_mae', 0):>8.4f}")
                         print("-" * 65)
-                        
+
                         for mod in ["t1ce", "flair"]:
                             if f"val_{mod}_ssim" in val_stats:
-                                print(f"[{mod.upper():>5}] PSNR: {val_stats[f'val_{mod}_psnr']:>7.4f}  |  SSIM: {val_stats[f'val_{mod}_ssim']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_mae']:>7.4f}")
-                        print(f"{'='*50}\n")
+                                print(
+                                    f"[{mod.upper():>5}] PSNR: {val_stats[f'val_{mod}_psnr']:>7.4f}  |  SSIM: {val_stats[f'val_{mod}_ssim']:>7.4f}  |  MAE: {val_stats[f'val_{mod}_mae']:>7.4f}")
+                        print(f"{'=' * 50}\n")
                     else:
                         print(f"Total Loss: {t_loss:>8.6f}  |  Noise MSE: {n_mse:>8.6f}")
                         print(f"MAE Loss:   {m_loss:>8.6f}  |  SSIM Loss: {s_loss:>8.6f}")
-                        print(f"{'='*46}\n")
+                        print(f"{'=' * 46}\n")
 
                     # --- DUAL CHECKPOINTING ---
                     # Save the Math Checkpoint (Noise) - Updates on Light AND Heavy
@@ -775,7 +787,7 @@ def main():
                             model, optimizer, scheduler_lr, scaler,
                             step, best_val, cfg, ema=ema
                         )
-                    
+
                     if do_heavy_val:
                         if "val_ssim" in val_stats and val_stats["val_ssim"] > best_ssim:
                             best_ssim = float(val_stats["val_ssim"])
@@ -809,9 +821,11 @@ def main():
                                     "val_ssim": float(val_stats.get("val_ssim", 0.0)),
                                     "val_mae": float(val_stats.get("val_mae", 0.0)),
                                     "val_psnr": float(val_stats.get("val_psnr", 0.0)),
-                                    "val_raw_ssim": float(val_stats.get("val_raw_ssim", val_stats.get("val_ssim", 0.0))),
+                                    "val_raw_ssim": float(
+                                        val_stats.get("val_raw_ssim", val_stats.get("val_ssim", 0.0))),
                                     "val_raw_mae": float(val_stats.get("val_raw_mae", val_stats.get("val_mae", 0.0))),
-                                    "val_raw_psnr": float(val_stats.get("val_raw_psnr", val_stats.get("val_psnr", 0.0))),
+                                    "val_raw_psnr": float(
+                                        val_stats.get("val_raw_psnr", val_stats.get("val_psnr", 0.0))),
                                     "val_noise_mse": float(val_stats.get("val_noise_mse", 0.0)),
                                 })
 
@@ -876,6 +890,7 @@ def main():
             step, best_val, cfg, ema=ema
         )
         print("Saved interrupt checkpoint.")
+
 
 if __name__ == "__main__":
     main()

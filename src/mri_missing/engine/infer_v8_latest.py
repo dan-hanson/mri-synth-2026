@@ -14,8 +14,9 @@ from mri_missing.diffusion.scheduler import DiffusionScheduler
 from mri_missing.models.time_embedding import SinusoidalTimeEmbedding
 from mri_missing.utils.io import load_checkpoint, save_json
 from mri_missing.utils.cases import MOD_KEYS, resolve_case_dirs
-from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_per_case_01_np, normalize_strict_bound
-from mri_missing.utils.visualization import save_slice_panel, save_paper_grid_panel
+from mri_missing.utils.nifti import load_case, save_prediction_nifti, normalize_zscore, normalize_per_case_01_np, \
+    normalize_strict_bound
+from mri_missing.utils.visualization import save_slice_panel
 from monai.inferers import sliding_window_inference
 from mri_missing.utils.ema import EMA
 from mri_missing.metrics.image_metrics import ImageMetricBundle
@@ -221,7 +222,7 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
         trained_betas=trained_betas_np,
         beta_schedule="scaled_linear",
         clip_sample=True,  # Anchors the healthy tissue
-        clip_sample_range=3,  # The pressure valve for the tumor
+        clip_sample_range=1.5,  # The pressure valve for the tumor
         thresholding=False,  # Prevents global gray mush
     )
     scheduler.set_timesteps(cfg["inference"]["reverse_steps"])
@@ -235,41 +236,21 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
     use_class_embed = cfg["model"].get("use_target_class_embed", True)
-
-    use_class_embed = cfg["model"].get("use_target_class_embed", True)
-
-    # --- FIX: HANDLE THE NEW PER-MODALITY CFG DICTIONARY ---
-    cfg_dict = cfg["inference"].get("cfg_guidance_scale", {})
-    guidance_scale = cfg_dict.get(missing_key, 1.0) if isinstance(cfg_dict, dict) else cfg_dict
-    # -------------------------------------------------------
-
-    mod_to_idx = {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
+    guidance_scale = cfg["inference"].get("cfg_guidance_scale", 1.0)
 
     mod_to_idx = {"t1": 0, "t1ce": 1, "t2": 2, "flair": 3}
     target_idx = torch.tensor([mod_to_idx[missing_key]], device=device, dtype=torch.long)
-    null_idx = torch.tensor([4], device=device, dtype=torch.long)
+    null_idx = torch.tensor([5], device=device, dtype=torch.long)
 
     for t_idx in scheduler.timesteps:
         t_scalar = int(t_idx.item()) if torch.is_tensor(t_idx) else int(t_idx)
         t = torch.tensor([t_scalar], device=device, dtype=torch.long)
 
-        # --- NEW: CFG FADE-OUT ---
-        # Turn off CFG for the final 20% of the denoising process to smooth the grain.
-        total_train_steps = cfg["diffusion"]["timesteps"]
-        fade_threshold = total_train_steps * 0.20
-
-        current_guidance = guidance_scale if t_scalar > fade_threshold else 1.0
-        # -------------------------
-
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            if current_guidance > 1.0:  # <--- Update this to check current_guidance
+            if guidance_scale > 1.0:
                 cond_zero = torch.zeros_like(cond)
-                if cond.shape[1] >= 8:
-                    cond_zero[:, :4] = -1.0
-                    cond_zero[:, 4:8] = 0.0
-                else:
-                    cond_zero[:] = -1.0
 
+                # Wrap predictors to safely expand batch sizes for the sliding window
                 def pred_cond_fn(patch_in):
                     bs = patch_in.shape[0]
                     return model(patch_in, t.expand(bs),
@@ -277,20 +258,27 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
                 def pred_uncond_fn(patch_in):
                     bs = patch_in.shape[0]
-                    return model(patch_in, t.expand(bs),
-                                 class_labels=target_idx.expand(bs) if use_class_embed else None)
+                    return model(patch_in, t.expand(bs), class_labels=null_idx.expand(bs) if use_class_embed else None)
 
+                # --- CRITICAL FIX: mode="gaussian" ---
                 noise_cond = sliding_window_inference(
-                    inputs=torch.cat([cond, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size,
-                    predictor=pred_cond_fn, overlap=overlap, mode="gaussian"
+                    inputs=torch.cat([cond, x], dim=1),
+                    roi_size=roi_size,
+                    sw_batch_size=sw_batch_size,
+                    predictor=pred_cond_fn,
+                    overlap=overlap,
+                    mode="gaussian"
                 )
                 noise_uncond = sliding_window_inference(
-                    inputs=torch.cat([cond_zero, x], dim=1), roi_size=roi_size, sw_batch_size=sw_batch_size,
-                    predictor=pred_uncond_fn, overlap=overlap, mode="gaussian"
+                    inputs=torch.cat([cond_zero, x], dim=1),
+                    roi_size=roi_size,
+                    sw_batch_size=sw_batch_size,
+                    predictor=pred_uncond_fn,
+                    overlap=overlap,
+                    mode="gaussian"
                 )
 
-                # Use current_guidance here!
-                pred_noise = noise_uncond + current_guidance * (noise_cond - noise_uncond)
+                pred_noise = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
             else:
                 def predictor(patch_in):
                     bs = patch_in.shape[0]
@@ -310,48 +298,14 @@ def infer_single_case(cfg, model, diffusion, case_dir, missing_key, device):
 
     elapsed = time.time() - start
 
-    # 1. Get the raw, unclipped crop (safely ranging up to 5.0 now)
     pred_crop = x[0, 0].detach().float().cpu().numpy()
+    pred_crop = np.clip(pred_crop, -1.0, 1.0)
 
-    # [DELETED: pred_crop = np.clip(pred_crop, -1.0, 1.0)]
-
-    # 2. Create the empty full volume
     pred_full = np.full_like(target_np, -1.0, dtype=np.float32)
-
-    # 3. Paste the unclipped crop into the volume
     pred_full[d0:d1, h0:h1, w0:w1] = pred_crop
 
-    # 4. Wipe out any hallucinations outside the physical skull
     pred_full = np.where(available_mask, pred_full, -1.0)
     eval_mask_full = available_mask.astype(np.float32)
-
-    # ---------------------------------------------------------
-    # --- HISTOGRAM MATCHING (DC SHIFT CURE) ---
-    # ---------------------------------------------------------
-    try:
-        from skimage.exposure import match_histograms
-
-        mask_bool = available_mask.astype(bool)
-
-        # Extract ONLY the brain tissue so the massive black background doesn't skew the math
-        pred_tissue = pred_full[mask_bool]
-
-        # Match to the Target for strict evaluation/metrics.
-        # (For blind clinical inference, change target_np to cond_np[0] to match against T1)
-        target_tissue = target_np[mask_bool]
-
-        # Perform the non-linear distribution mapping
-        matched_tissue = match_histograms(pred_tissue, target_tissue)
-
-        # Inject the perfectly contrasted tissue back into the full volume
-        pred_full[mask_bool] = matched_tissue
-
-        # Safely clip just in case the matching pushed a stray pixel slightly out of bounds
-        pred_full = np.clip(pred_full, -1.0, 1.0)
-
-    except ImportError:
-        print("Warning: scikit-image not installed. Skipping histogram matching.")
-    # ---------------------------------------------------------
 
     return (
         pred_full.astype(np.float32),
@@ -389,7 +343,7 @@ def main():
     infer_model = ema.shadow if (ema is not None and cfg["ema"]["infer_with_ema"]) else model
     infer_model.eval()
 
-    # --- COMPILER FOR LINUX ---
+    # --- COMPILER TRICK FOR BLACKWELL ---
     if cfg["inference"].get("use_compile", False):
         if os.name == "nt":
             print("Warning: torch.compile is not fully supported on Windows. Skipping compile.")
@@ -426,7 +380,7 @@ def main():
         random_case_seed=cfg["inference"].get("random_case_seed", 42),
     )
 
-    # --- Generate a Unique Run ID ---
+    # --- NEW: Generate a Unique Run ID ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     custom_run_name = cfg["inference"].get("run_name", "run")
     unique_run_id = f"{custom_run_name}_{timestamp}"
@@ -435,11 +389,11 @@ def main():
         cfg["project"]["output_root"],
         cfg["inference"]["output_subdir"],
         cfg["model"]["name"],
-        unique_run_id  # <--- Nests everything safely inside a unique folder
+        unique_run_id  # <--- Nests everything safely inside a unique folder!
     )
     ensure_dir(base_out)
 
-    # --- SAFE JSON LOADING ---
+    # --- FIX: SAFE JSON LOADING ---
     summary_path = os.path.join(base_out, "summary.json")
     if os.path.exists(summary_path):
         with open(summary_path, "r") as f:
@@ -447,79 +401,69 @@ def main():
     else:
         summary = []
     # ------------------------------
-    # --- GET PANEL MODE ---
-    panel_mode = cfg["inference"].get("panel_mode", "slice")
-
     for case_dir in case_dirs:
         case_id = os.path.basename(case_dir)
 
-        # --- AUTO-OVERRIDE MISSING KEYS FOR GRID MODE ---
-        if panel_mode == "grid":
-            current_missing_keys = MOD_KEYS  # Force all 4 modalities
-        else:
-            current_missing_keys = missing_keys  # Use config keys
-
-        grid_targets = {}
-        grid_preds = {}
-
-        for current_key in current_missing_keys:
+        for missing_key in missing_keys:
             pred, target, cond, affine, header, elapsed, norm_data_dict, raw_data_dict, eval_mask = infer_single_case(
-                cfg, infer_model, diffusion, case_dir, current_key, device
+                cfg, infer_model, diffusion, case_dir, missing_key, device
             )
 
             pred_t = torch.tensor(pred[None, None], dtype=torch.float32)
             target_t = torch.tensor(target[None, None], dtype=torch.float32)
             mask_t = torch.tensor(eval_mask[None, None], dtype=torch.float32)
 
-            # Compute metrics
+            infer_metrics = metric_bundle(pred_t, target_t, mask=mask_t)
+            # --- NEW: Parallel Full-Volume Metrics ---
+            # Compute strict clinical metrics in [-1.0, 1.0] space
             infer_metrics = metric_bundle(pred_t, target_t, mask=mask_t)
             if cfg["metrics"].get("compute_full_volume", False):
                 full_metrics = metric_bundle(pred_t, target_t, mask=None)
                 for k, v in full_metrics.items():
                     infer_metrics[f"full_{k}"] = v
 
-            item_dir = os.path.join(base_out, f"{case_id}_{current_key}")
+            item_dir = os.path.join(base_out, f"{case_id}_{missing_key}")
             ensure_dir(item_dir)
 
-            # Un-normalize for NIfTI and Images
-            raw_target = raw_data_dict[current_key]
+            # ---------------------------------------------------------
+            # --- NEW: UN-NORMALIZE FOR CLINICAL EXPORT & VISUALS ---
+            # ---------------------------------------------------------
+            raw_target = raw_data_dict[missing_key]
             raw_min, raw_max = raw_target.min(), raw_target.max()
 
+            # Map prediction from [-1, 1] to [0, 1]
             pred_01 = (pred + 1.0) / 2.0
+
+            # Project [0, 1] to the patient's native physical intensity
             pred_native = (pred_01 * (raw_max - raw_min)) + raw_min
+
+            # Mask out the background to perfectly match the raw file
             pred_native = np.where(eval_mask, pred_native, raw_target.min())
 
-            # Save NIfTIs
             if cfg["inference"]["save_nifti"]:
-                nifti_path = os.path.join(item_dir, f"{case_id}_pred_{current_key}.nii.gz")
+                nifti_path = os.path.join(item_dir, f"{case_id}_pred_{missing_key}.nii.gz")
                 save_prediction_nifti(pred_native, affine, header, nifti_path)
 
                 if cfg["inference"].get("save_composite_nifti", True):
                     composite = []
                     for k in MOD_KEYS:
-                        if k == current_key:
+                        if k == missing_key:
                             composite.append(pred_native)
                         else:
-                            composite.append(raw_data_dict[k])
+                            composite.append(raw_data_dict[k])  # Use RAW data
+
                     composite = np.stack(composite, axis=0).astype(np.float32)
-                    comp_path = os.path.join(item_dir, f"{case_id}_composite_{current_key}.nii.gz")
+                    comp_path = os.path.join(item_dir, f"{case_id}_composite_{missing_key}.nii.gz")
                     save_prediction_nifti(composite, affine, header, comp_path)
 
-            # --- ROUTE THE VISUALIZATIONS ---
             if cfg["inference"]["save_png"]:
-                if panel_mode == "slice":
-                    png_path = os.path.join(item_dir, f"{case_id}_panel_{current_key}.png")
-                    save_slice_panel(cond, raw_target, pred_native, png_path, missing_key=current_key,
-                                     title=f"{case_id}")
-                elif panel_mode == "grid":
-                    # Store them in memory until all 4 modalities are finished
-                    grid_targets[current_key] = raw_target
-                    grid_preds[current_key] = pred_native
+                png_path = os.path.join(item_dir, f"{case_id}_panel_{missing_key}.png")
+                # Pass the native target and native prediction so the Abs Diff math is accurate
+                save_slice_panel(cond, raw_target, pred_native, png_path, missing_key=missing_key, title=f"{case_id}")
 
-            # Save Metrics Log
             summary.append({
                 "case_id": case_id,
-                "missing_key": current_key,
+                "missing_key": missing_key,
                 "elapsed_sec": elapsed,
                 "checkpoint": ckpt_path,
                 "reverse_steps": cfg["inference"]["reverse_steps"],
@@ -528,14 +472,8 @@ def main():
                 **infer_metrics,
             })
 
-            print(f"[infer] case={case_id} missing={current_key} time={elapsed:.2f}s")
+            print(f"[infer] case={case_id} missing={missing_key} time={elapsed:.2f}s")
             save_json(summary_path, summary)
-
-        # --- GENERATE THE GRID PANEL AT THE END OF THE CASE ---
-        if cfg["inference"]["save_png"] and panel_mode == "grid":
-            grid_out_path = os.path.join(base_out, f"{case_id}_paper_grid.png")
-            save_paper_grid_panel(grid_targets, grid_preds, grid_out_path, title=f"{case_id} Full Synthesis")
-            print(f"[infer] Saved paper grid to {grid_out_path}")
 
     print(f"Saved inference outputs to: {base_out}")
 

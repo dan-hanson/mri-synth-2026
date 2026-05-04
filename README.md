@@ -1,332 +1,220 @@
-# MRI Missing Modality Synthesis (Diffusion-Based)
+# MRI Missing-Modality Synthesis
 
-## Overview
+A diffusion-based pipeline for synthesizing missing MRI modalities (T1, T1ce, T2, FLAIR) from the modalities that are present, trained on BraTS-GLI 2023.
 
-This project implements a **3D diffusion-based model** for **missing MRI modality synthesis** using BraTS-style datasets.
-Given 3 MRI modalities (e.g., T1, T2, FLAIR), the model learns to generate the missing fourth modality.
-
-The system is designed to be:
-
-* modular (multiple backbones supported)
-* reproducible (config-driven)
-* extensible (ready for experimentation with architectures and diffusion strategies)
+The model conditions on the available modalities plus a presence mask, and a denoising network learns to reconstruct whichever modality is held out. Conditioning is built from the four image channels and four binary mask channels (8 conditioning channels total), with a noisy version of the target stacked on top to give a 9-channel input to the denoiser.
 
 ---
 
-## What This Repo Currently Does
+## Requirements
 
-### Core Pipeline
+- **Python 3.11** (required — newer or older versions are not currently supported)
+- A CUDA-capable GPU is strongly recommended for training. Inference can run on CPU but will be slow.
+- The BraTS-GLI 2023 dataset (training and validation splits)
 
-* ✅ Loads BraTS-format 3D MRI volumes (`.nii.gz`)
-* ✅ Normalizes data (z-score)
-* ✅ Randomly drops one modality during training
-* ✅ Uses a **single model for all missing-modality combinations**
-* ✅ Trains a **diffusion model (noise prediction)**
-* ✅ Supports **full-volume inference via sliding window**
-* ✅ Saves:
-
-  * NIfTI outputs
-  * PNG slice panels
-  * JSON summaries
+The repo includes a `.python-version` file pinning the interpreter to 3.11. If you use `pyenv` or `uv`, the right Python will be selected automatically when you `cd` into the project.
 
 ---
 
-### Model & Training Features
-
-* ✅ Config-driven architecture selection
-* ✅ Modular model registry (UNet, ConvNeXt-ready, etc.)
-* ✅ Diffusion timestep conditioning
-* ✅ Mixed precision training (AMP)
-* ✅ Learning rate scheduling
-* ✅ Composite loss:
-
-  * Noise MSE (core diffusion loss)
-  * MAE (reconstruction)
-  * SSIM (structure)
-* ✅ EMA (Exponential Moving Average) for stabilization
-* ✅ Validation:
-
-  * light (loss only)
-  * heavy (MAE, PSNR, SSIM)
-
----
-
-### Inference Features
-
-* ✅ Full 3D reconstruction using **sliding-window inference**
-* ✅ Configurable reverse diffusion steps
-* ✅ Reproducible case selection:
-
-  * fixed list OR
-  * seeded random subset
-* ✅ Outputs:
-
-  * predicted volume (.nii.gz)
-  * visualization panel (.png)
-  * metrics summary (.json)
-
----
-
-### Conditioning Strategy
-
-* 4 modality slots (T1, T1ce, T2, FLAIR)
-* Missing modality handled via:
-
-  * configurable fill value
-  * optional presence mask (recommended)
-
----
-
-## Project Structure (Simplified)
-
-```
-src/mri_missing/
-│
-├── config.py
-├── data/
-│   ├── dataset.py
-│   └── test_loader.py
-│
-├── engine/
-│   ├── train.py
-│   ├── infer.py
-│   └── train_minimal.py
-│
-├── models/
-│   ├── registry.py
-│   ├── unet3d.py
-│   └── convnext3d.py (planned/partial)
-│
-├── diffusion/
-│   └── scheduler.py
-│
-├── losses/
-│   └── image_losses.py
-│
-├── metrics/
-│   └── image_metrics.py
-│
-├── utils/
-│   ├── ema.py
-│   ├── io.py
-│   ├── cases.py
-│   └── vis.py
-│
-configs/
-└── base.yaml
-```
-
----
-
-## Setup Instructions
-
-### 1. Clone repo
+## One-time setup
 
 ```bash
-git clone <repo-url>
+# 1. Clone the repo
+git clone <your-repo-url>
 cd mri-synth-2026
-```
 
-### 2. Create environment
+# 2. Create a Python 3.11 virtual environment
+python3.11 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-Using micromamba (recommended):
-
-```bash
-micromamba create -f environment.yml
-micromamba activate mri_v1
-```
-
-Alternative:
-
-```bash
+# 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Make the BraTS data available under data/GLI/
+#    Either copy the data into data/GLI/, or symlink it:
+ln -s /path/to/your/brats/data data/GLI
 ```
 
-> ⚠️ You may want to install PyTorch manually with CUDA support depending on your system.
+After step 4, `data/GLI/` should contain these two folders:
+
+```
+data/GLI/
+├── ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData/
+└── ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData/
+```
+
+You do not need to set `PYTHONPATH` or install the package. Each entry-point script imports `_path_bootstrap` first, which finds the project root and adds `src/` to `sys.path` automatically.
 
 ---
 
-### 3. Download dataset
+## Running the pipeline
 
-Use BraTS-style dataset structure:
+All paths and hyperparameters live in `configs/base.yaml`. Paths in the YAML are interpreted relative to the project root, so the same config works on any machine without edits.
 
-```
-data/
-└── GLI/
-    ├── TrainingData/
-    │   ├── BraTS-GLI-xxxxx/
-    │   │   ├── *-t1n.nii.gz
-    │   │   ├── *-t1c.nii.gz
-    │   │   ├── *-t2w.nii.gz
-    │   │   ├── *-t2f.nii.gz
-    │   │   └── *-seg.nii.gz
+### Sanity check (optional)
+
+Verify a case loads correctly and produces the expected tensor shapes:
+
+```bash
+python dataset_test.py
 ```
 
-Update paths in:
+### Step 1 — Preprocess NIfTI data into `.pt` cache files
 
-```yaml
-configs/base.yaml
+```bash
+python scripts/preprocess_to_pt.py
 ```
 
----
+Reads `configs/base.yaml` for the data and cache locations and writes one `.pt` file per case into `cache/train/` and `cache/val/`. Already-cached cases are skipped, so re-running is safe.
 
-### 4. Run training
+### Step 2 — Verify the cache (optional)
+
+```bash
+python scripts/inspect_data.py
+
+# or pick a different case:
+CASE_ID=BraTS-GLI-00001-000 python scripts/inspect_data.py
+```
+
+Compares one raw case to its cached version and prints per-modality diffs. Useful before kicking off a long training run.
+
+### Step 3 — Train
 
 ```bash
 python src/mri_missing/engine/train.py
 ```
 
----
+Outputs land in `outputs/<run_name>/` with `checkpoints/`, `logs/`, an augmentation preview PNG, and a copy of the config that was used.
 
-### 5. Run inference
+To stop a running job cleanly (saves a checkpoint first), drop a `STOP` file in the run directory:
+
+```bash
+touch outputs/COMBO_01/STOP
+```
+
+To resume from a checkpoint, set `train.resume` in `base.yaml` to point at the checkpoint path before relaunching.
+
+### Step 4 — Inference
 
 ```bash
 python src/mri_missing/engine/infer.py
 ```
 
-Outputs:
+Uses the `inference:` block in `base.yaml` — which run, which checkpoint, which cases, which modality to drop, etc. Outputs go to `outputs/<run_name>/inference/`.
 
-```
-outputs/
-└── inference/
-    ├── *.nii.gz
-    ├── *.png
-    └── summary.json
+### Step 5 — Evaluation across the validation set
+
+```bash
+python src/mri_missing/engine/eval.py
 ```
 
+Runs metrics over the validation cache, controlled by `inference.max_eval_cases` in the YAML (`0` means run the full set). Outputs land in `outputs/evaluations/<run_name>_<timestamp>/`.
+
 ---
 
-## Key Config Parameters
+## Quick reference
 
-### Training
+| Stage | Command |
+|---|---|
+| Sanity check | `python dataset_test.py` |
+| Preprocess | `python scripts/preprocess_to_pt.py` |
+| Verify cache | `python scripts/inspect_data.py` |
+| Train | `python src/mri_missing/engine/train.py` |
+| Infer | `python src/mri_missing/engine/infer.py` |
+| Eval | `python src/mri_missing/engine/eval.py` |
+| Stop training | `touch outputs/<run_name>/STOP` |
 
-```yaml
-train:
-  max_steps: ...
-  batch_size: ...
-  use_amp: true
+---
+
+## Repo layout
+
+```
+mri-synth-2026/
+├── _path_bootstrap.py           # adds src/ to sys.path for repo-root scripts
+├── dataset_test.py              # smoke test
+├── README.md
+├── requirements.txt
+├── .python-version              # pins Python to 3.11
+│
+├── configs/
+│   └── base.yaml                # all paths and hyperparameters
+│
+├── data/                        # BraTS data lives here (gitignored)
+│   └── GLI/
+│
+├── cache/                       # populated by preprocess_to_pt.py (gitignored)
+│   ├── train/
+│   └── val/
+│
+├── outputs/                     # run artifacts (gitignored)
+│
+├── scripts/
+│   ├── _path_bootstrap.py       # local copy for scripts in this folder
+│   ├── inspect_data.py
+│   └── preprocess_to_pt.py
+│
+└── src/
+    └── mri_missing/             # the package
+        ├── config.py            # YAML loader + project-root resolution
+        ├── seed.py
+        ├── data/dataset.py
+        ├── diffusion/scheduler.py
+        ├── engine/
+        │   ├── _path_bootstrap.py
+        │   ├── train.py
+        │   ├── train_minimal.py
+        │   ├── infer.py
+        │   ├── infer_v8_latest.py
+        │   └── eval.py
+        ├── losses/image_losses.py
+        ├── metrics/image_metrics.py
+        ├── models/              # UNet, ConvNeXt3D, SwinUNETR, MONAI diffusion
+        └── utils/               # cases, ema, io, nifti, stats, visualization
 ```
 
-### Diffusion
-
-```yaml
-diffusion:
-  timesteps: 1000
-```
-
-### Inference
-
-```yaml
-inference:
-  reverse_steps: 50   # important for speed vs quality
-```
-
-### Missing Modality Strategy
-
-```yaml
-missing_policy:
-  fill_value: 1.0
-  use_presence_mask: true
-```
+The three copies of `_path_bootstrap.py` are intentional. When you run a script with `python <path>`, Python only adds the script's own directory to `sys.path`, so the bootstrap has to live next to anything that imports it. The contents of all three copies are identical.
 
 ---
 
-## Current Limitations
+## Configuration
 
-* Small baseline model (~350k params)
-* No pretrained backbone yet
-* Diffusion variant is simplified (noise prediction only)
-* Sliding window inference is correct but still slow at high steps
-* No segmentation-based evaluation yet
-* No distributed or multi-GPU training
+Almost everything is controlled by `configs/base.yaml`. The most common knobs:
 
----
+- `project.run_name` — name for this run's output folder. Set to `null` for an auto-timestamped name.
+- `data.backend` — `pt_cache` (fast, normal) or `nifti` (slow, raw `.nii.gz` on the fly).
+- `train.max_steps`, `train.resume`, `optim.lr` — duration, checkpoint resume path, learning rate.
+- `inference.run_dir`, `inference.checkpoint_name`, `inference.case_ids`, `inference.missing_keys` — what to run inference on.
+- `inference.cfg_guidance_scale` — per-modality classifier-free guidance scale at inference time.
+- `missing_policy.sampling_probs` — probability of dropping each modality during training.
 
-## What We Still Need To Do
-
-### High Priority
-
-* [ ] Add **pretrained backbone support**
-
-  * Swin (medical pretrained)
-  * ConvNeXt-3D
-* [ ] Implement **learned sigma / predict-x0 diffusion variants**
-* [ ] Add **segmentation-based evaluation**
-* [ ] Improve **inference speed**
-
-  * reduced step schedules
-  * DDIM / fast sampling
+All path values in the YAML are auto-resolved against the project root by `load_config()`, so they work on any machine without edits. Absolute paths are also accepted if you keep data on a separate disk.
 
 ---
 
-### Medium Priority
+## Troubleshooting
 
-* [ ] Add **better normalization strategy**
+**`ModuleNotFoundError: No module named 'mri_missing'`**
 
-  * brain masking
-  * modality-specific scaling
-* [ ] Add **dataset caching / prefetching**
-* [ ] Add **training visualizations over time**
-* [ ] Improve **logging (TensorBoard or similar)**
+The bootstrap didn't fire. Confirm `_path_bootstrap.py` exists in the same directory as the script you're running:
 
----
+- Repo-root scripts (`dataset_test.py`) → root copy
+- `scripts/*.py` → `scripts/_path_bootstrap.py`
+- `src/mri_missing/engine/*.py` → `src/mri_missing/engine/_path_bootstrap.py`
 
-### Architecture / Research Extensions
+**`FileNotFoundError` on a data path**
 
-* [ ] Multi-head modality prediction (all outputs simultaneously)
-* [ ] Hybrid GAN + diffusion losses
-* [ ] Temporal consistency (for sequences)
-* [ ] Cross-attention between modalities
+Either `data/GLI/` isn't pointing at the right folder, or the BraTS subfolder names don't match what's in `base.yaml`. Run `python scripts/inspect_data.py` to confirm one case loads correctly.
 
----
+**CUDA out of memory during training**
 
-### Engineering / Infrastructure
+Drop `loader.batch_size` to 1, reduce `patch.size`, enable `train.use_amp: true`, or enable sliding-window inference under `inference.sliding_window` if the OOM is in the inference path.
 
-* [ ] Docker setup
-* [ ] CLI interface (argparse)
-* [ ] experiment tracking (wandb or similar)
-* [ ] better checkpoint/version management
+**`ImportError: cannot import name 'X' from 'mri_missing.utils.Y'`**
+
+A function being imported wasn't found in the module. Usually means a refactor left a stale import behind — check the actual definitions in the target file with `grep "^def " src/mri_missing/utils/<file>.py`.
 
 ---
 
-## Notes for Contributors
+## Why Python 3.11 specifically?
 
-* Everything is intended to be **config-driven**
-* Avoid hardcoding paths or hyperparameters
-* Keep modules independent and swappable
-* Prefer clarity over premature optimization
-
----
-
-## Current Status
-
-The pipeline is **fully functional end-to-end**:
-
-* training ✅
-* validation ✅
-* inference ✅
-* visualization ✅
-* reproducibility (seeded selection) ✅
-
-Next phase is:
-
-> **scaling model quality and efficiency**
-
----
-
-## Acknowledgment
-
-Inspired by BraTS 2025 challenge approaches and diffusion-based medical imaging literature.
-
----
-
-## Contact / Collaboration
-
-If you're working on this project:
-
-* start with `configs/base.yaml`
-* verify dataset paths
-* run a short training test (50–100 steps)
-* then move to full experiments
-
----
+The codebase uses syntax and typing features that are 3.10+ (PEP 604 union types, structural pattern matching in some places), and several of the model dependencies (a particular pin of `diffusers`, `monai`, and `torch`) were tested against 3.11 specifically. 3.12 changes the import system in ways that may break the bootstrap pattern, and 3.10 lacks some typing features used by the model registry. If you need to run on a different Python version, expect to do some debugging.

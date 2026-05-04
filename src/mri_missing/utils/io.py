@@ -20,9 +20,53 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, step, best_val=No
     )
 
 
+def _adapt_state_dict(saved_state, target_state):
+    """
+    Reconcile a saved state_dict with the target model's expected key prefixes.
+
+    torch.compile() wraps the model and prefixes every parameter key with
+    '_orig_mod.'. A checkpoint saved from a compiled model has the prefix;
+    one saved from an uncompiled model does not. If the current and saved
+    runs disagree on whether the model is compiled, we need to add or strip
+    the prefix so load_state_dict succeeds.
+    """
+    saved_keys = list(saved_state.keys())
+    target_keys = list(target_state.keys())
+
+    saved_has = any(k.startswith("_orig_mod.") for k in saved_keys)
+    target_has = any(k.startswith("_orig_mod.") for k in target_keys)
+
+    if saved_has == target_has:
+        # Both compiled or both not — leave keys alone and let load_state_dict
+        # surface any genuine architectural mismatch.
+        return saved_state
+
+    if saved_has and not target_has:
+        # Strip the prefix
+        return {
+            (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+            for k, v in saved_state.items()
+        }
+
+    # target_has and not saved_has — add the prefix
+    return {f"_orig_mod.{k}": v for k, v in saved_state.items()}
+
+
 def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ema=None, map_location="cpu"):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Checkpoint not found or not a file: {path}")
+
     ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model_state"])
+
+    # Adapt model state for compile prefix mismatch
+    model_state = _adapt_state_dict(ckpt["model_state"], model.state_dict())
+    missing, unexpected = model.load_state_dict(model_state, strict=False)
+    if missing or unexpected:
+        print(f"[load_checkpoint] model: {len(missing)} missing, {len(unexpected)} unexpected keys")
+        if missing:
+            print(f"  first missing: {missing[:3]}")
+        if unexpected:
+            print(f"  first unexpected: {unexpected[:3]}")
 
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -34,7 +78,9 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, em
         scaler.load_state_dict(ckpt["scaler_state"])
 
     if ema is not None and ckpt.get("ema_state") is not None:
-        ema.load_state_dict(ckpt["ema_state"])
+        # EMA shadow may also need prefix adaptation
+        ema_state = _adapt_state_dict(ckpt["ema_state"], ema.shadow.state_dict())
+        ema.load_state_dict(ema_state)
 
     return ckpt
 
